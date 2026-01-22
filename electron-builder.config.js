@@ -37,12 +37,11 @@ const config = {
     '!**/node_modules/.bin'
   ],
 
-  // Extra resources to bundle (MCP server)
+  // Extra resources to bundle
   extraResources: [
     {
-      from: 'resources/firecrawl-mcp-server',
-      to: 'firecrawl-mcp-server',
-      filter: ['**/*']
+      from: '.env',
+      to: '.env'
     }
   ],
 

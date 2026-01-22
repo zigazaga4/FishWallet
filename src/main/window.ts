@@ -1,8 +1,48 @@
-import { BrowserWindow } from 'electron';
+import { BrowserWindow, session, systemPreferences } from 'electron';
 import { join } from 'path';
 
 // Determine if running in development mode
 const isDev = process.env.NODE_ENV === 'development';
+
+// Set up permission handlers for media access (microphone, camera)
+function setupPermissionHandlers(): void {
+  const ses = session.defaultSession;
+
+  // Handle permission requests (microphone, camera, etc.)
+  ses.setPermissionRequestHandler((webContents, permission, callback) => {
+    const allowedPermissions = ['media', 'microphone', 'camera', 'audioCapture'];
+
+    if (allowedPermissions.includes(permission)) {
+      callback(true);
+    } else {
+      callback(false);
+    }
+  });
+
+  // Handle permission checks
+  ses.setPermissionCheckHandler((webContents, permission, requestingOrigin) => {
+    const allowedPermissions = ['media', 'microphone', 'camera', 'audioCapture'];
+    return allowedPermissions.includes(permission);
+  });
+}
+
+// Request microphone access on Windows/macOS
+async function requestMicrophoneAccess(): Promise<boolean> {
+  if (process.platform === 'darwin') {
+    // macOS requires explicit permission request
+    const status = systemPreferences.getMediaAccessStatus('microphone');
+    if (status === 'not-determined') {
+      return await systemPreferences.askForMediaAccess('microphone');
+    }
+    return status === 'granted';
+  } else if (process.platform === 'win32') {
+    // Windows 10/11 - check if microphone access is allowed in system settings
+    const status = systemPreferences.getMediaAccessStatus('microphone');
+    // On Windows, 'granted' means app has access, 'denied' means blocked in settings
+    return status === 'granted';
+  }
+  return true; // Linux and others
+}
 
 // Dev server URL from environment variable
 const DEV_SERVER_URL = process.env.VITE_DEV_SERVER_URL || 'http://localhost:5173';
@@ -17,6 +57,13 @@ const WINDOW_CONFIG = {
 
 // Create the main application window
 export async function createMainWindow(): Promise<BrowserWindow> {
+  // Set up permission handlers before creating window
+  setupPermissionHandlers();
+
+  // Request microphone access
+  const micAccess = await requestMicrophoneAccess();
+  console.log('[Window] Microphone access:', micAccess ? 'granted' : 'denied');
+
   const mainWindow = new BrowserWindow({
     width: WINDOW_CONFIG.width,
     height: WINDOW_CONFIG.height,

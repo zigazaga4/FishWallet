@@ -16,7 +16,19 @@ import { mcpClientService } from './services/mcpClient';
 import { logger } from './services/logger';
 
 // Load environment variables from .env file
-config({ path: join(app.getAppPath(), '.env') });
+// In production, .env might be in extraResources or app path
+const envPaths = [
+  join(app.getAppPath(), '.env'),
+  join(process.resourcesPath || '', '.env'),
+  join(app.isPackaged ? process.resourcesPath || '' : app.getAppPath(), '.env')
+];
+for (const envPath of envPaths) {
+  const result = config({ path: envPath });
+  if (!result.error) {
+    logger.info('[Main] Loaded .env from:', envPath);
+    break;
+  }
+}
 
 // Handle creating/removing shortcuts on Windows when installing/uninstalling
 // Only run on Windows with Squirrel installer
@@ -53,6 +65,7 @@ app.whenReady().then(async () => {
 
   // Initialize MCP (Firecrawl) - use env var or hardcoded fallback
   const firecrawlApiKey = process.env.FIRECRAWL_API_KEY || 'fc-b992ceca9119406899518232c096f14d';
+  logger.info('[Main] Initializing MCP with API key:', firecrawlApiKey ? 'present' : 'missing', 'source:', process.env.FIRECRAWL_API_KEY ? 'env' : 'hardcoded');
   mcpClientService.initialize(firecrawlApiKey).catch((error) => {
     logger.error('[Main] Failed to initialize MCP:', error);
   });

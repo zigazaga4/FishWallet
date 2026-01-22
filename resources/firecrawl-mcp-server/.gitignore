@@ -1,8 +1,8 @@
 # Dependencies
-node_modules/
+# node_modules/ # Commented out - needed for electron-builder packaging
 
 # Build
-dist/
+# dist/ # Commented out - needed for electron-builder packaging
 
 # Logs
 logs
