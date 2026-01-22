@@ -68,7 +68,7 @@ export class SpeechToTextService {
       writeFileSync(tempFilePath, audioBuffer);
 
       // Create a File object from the buffer for the API
-      const file = new File([audioBuffer], `audio.${extension}`, { type: mimeType });
+      const file = new File([new Uint8Array(audioBuffer)], `audio.${extension}`, { type: mimeType });
 
       // Call OpenAI transcription API
       // Language set to Romanian (ro) for better accuracy with Romanian speech
