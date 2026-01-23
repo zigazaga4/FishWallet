@@ -9,6 +9,7 @@ import { registerFileBuilderHandlers } from './ipc/fileBuilder';
 import { registerSandboxPreloadHandlers } from './ipc/sandboxPreload';
 import { registerDependencyNodesHandlers } from './ipc/dependencyNodes';
 import { registerMcpHandlers } from './ipc/mcp';
+import { registerPanelErrorHandlers } from './ipc/panelErrors';
 import { initializeDatabase, closeDatabase } from './db';
 import { speechToTextService } from './services/speechToText';
 import { langChainService } from './services/langchain';
@@ -62,6 +63,7 @@ app.whenReady().then(async () => {
   registerSandboxPreloadHandlers();
   registerDependencyNodesHandlers();
   registerMcpHandlers();
+  registerPanelErrorHandlers();
 
   // Initialize MCP (Firecrawl) - use env var or hardcoded fallback
   const firecrawlApiKey = process.env.FIRECRAWL_API_KEY || 'fc-b992ceca9119406899518232c096f14d';

@@ -488,50 +488,75 @@ export function DependencyNodesView({
   const [panStart, setPanStart] = useState({ x: 0, y: 0, offsetX: 0, offsetY: 0 });
 
   const containerRef = useRef<HTMLDivElement>(null);
-  const lastConnectionCount = useRef<number>(0);
-  const lastNodeCount = useRef<number>(0);
+  const lastConnectionCount = useRef<number>(-1); // -1 means "not initialized"
   const manuallyPositioned = useRef<Set<string>>(new Set());
+  const layoutInProgress = useRef<boolean>(false);
+  const layoutAttemptedForNodes = useRef<Set<string>>(new Set());
 
-  // Auto-layout effect - triggers when nodes/connections change
-  // Re-layouts all nodes when connection structure changes
+  // Auto-layout effect - ONLY triggers for new nodes at (0,0) or connection changes
   useEffect(() => {
+    // Don't run layout while loading
+    if (isLoading) return;
     if (nodes.length === 0 || !onNodePositionChange) return;
 
-    const connectionCountChanged = connections.length !== lastConnectionCount.current;
-    const nodeCountChanged = nodes.length !== lastNodeCount.current;
+    // Prevent concurrent layout operations
+    if (layoutInProgress.current) return;
 
     // Check for new nodes at (0,0) that need initial layout
     const newNodesAtOrigin = nodes.filter(
-      n => n.positionX === 0 && n.positionY === 0
+      n => n.positionX === 0 && n.positionY === 0 && !layoutAttemptedForNodes.current.has(n.id)
     );
 
-    // Re-layout if:
-    // 1. New connections were added (structure changed)
-    // 2. New nodes exist at (0,0)
-    const shouldRelayout = connectionCountChanged || newNodesAtOrigin.length > 0;
+    // Check if connections actually changed (not first mount)
+    const isFirstMount = lastConnectionCount.current === -1;
+    const connectionCountChanged = !isFirstMount && connections.length !== lastConnectionCount.current;
 
-    if (!shouldRelayout) return;
-
-    // Update tracking
+    // Update connection count tracking
     lastConnectionCount.current = connections.length;
-    lastNodeCount.current = nodes.length;
 
-    // Calculate positions for all nodes based on current connections
+    // Only layout if there are new nodes at origin
+    // Connection changes only trigger relayout if there are already nodes needing layout
+    if (newNodesAtOrigin.length === 0 && !connectionCountChanged) return;
+
+    // If it's just a connection change with no nodes at origin, skip
+    if (connectionCountChanged && newNodesAtOrigin.length === 0) return;
+
+    // Mark all current nodes as "attempted"
+    nodes.forEach(n => layoutAttemptedForNodes.current.add(n.id));
+    layoutInProgress.current = true;
+
+    // Calculate positions
     const positions = calculateAutoLayout(nodes, connections);
 
-    // Apply positions to nodes that haven't been manually dragged
+    // Collect position changes
+    const positionChanges: Array<{ nodeId: string; x: number; y: number }> = [];
+
     nodes.forEach(node => {
-      // Skip nodes that user has manually positioned (unless it's at 0,0)
+      // Skip manually positioned nodes (unless at 0,0)
       if (manuallyPositioned.current.has(node.id) && node.positionX !== 0 && node.positionY !== 0) {
         return;
       }
 
       const pos = positions.get(node.id);
-      if (pos) {
-        onNodePositionChange(node.id, pos.x, pos.y);
+      if (pos && (node.positionX !== pos.x || node.positionY !== pos.y)) {
+        positionChanges.push({ nodeId: node.id, x: pos.x, y: pos.y });
       }
     });
-  }, [nodes, connections, onNodePositionChange]);
+
+    // Apply changes
+    if (positionChanges.length > 0) {
+      setTimeout(() => {
+        positionChanges.forEach(change => {
+          onNodePositionChange(change.nodeId, change.x, change.y);
+        });
+        setTimeout(() => {
+          layoutInProgress.current = false;
+        }, 300);
+      }, 0);
+    } else {
+      layoutInProgress.current = false;
+    }
+  }, [nodes, connections, onNodePositionChange, isLoading]);
 
   // Track when user manually drags a node
   const markAsManuallyPositioned = useCallback((nodeId: string) => {
@@ -646,8 +671,9 @@ export function DependencyNodesView({
   const handleRelayout = useCallback(() => {
     if (!onNodePositionChange || nodes.length === 0) return;
 
-    // Clear manually positioned tracking
+    // Clear tracking to allow fresh layout
     manuallyPositioned.current.clear();
+    layoutAttemptedForNodes.current.clear();
 
     // Calculate fresh layout
     const positions = calculateAutoLayout(nodes, connections);
@@ -658,6 +684,8 @@ export function DependencyNodesView({
       if (pos) {
         onNodePositionChange(node.id, pos.x, pos.y);
       }
+      // Mark as attempted after manual layout
+      layoutAttemptedForNodes.current.add(node.id);
     });
   }, [nodes, connections, onNodePositionChange]);
 

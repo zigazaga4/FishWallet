@@ -5,6 +5,7 @@ import { ThinkingBlock } from './ThinkingBlock';
 import { WebSearchBlock } from './WebSearchBlock';
 import { ProposedNoteBlock } from './ProposedNoteBlock';
 import { Panel, type PanelTab } from './Panel';
+import { wakeWordService } from '../services/wakeWordService';
 
 // Content block for ordered display - includes thinking blocks for proper ordering
 interface ContentBlock {
@@ -190,10 +191,17 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
   const [dependencyConnections, setDependencyConnections] = useState<DependencyNodeConnection[]>([]);
   const [dependencyNodesLoading, setDependencyNodesLoading] = useState<boolean>(false);
 
+  // Voice input state
+  const [isRecording, setIsRecording] = useState<boolean>(false);
+  const [isProcessingAudio, setIsProcessingAudio] = useState<boolean>(false);
+  const [isWakeWordEnabled, setIsWakeWordEnabled] = useState<boolean>(false);
+  const [isWakeWordAvailable] = useState<boolean>(wakeWordService.isAvailable());
+
   // Use refs to prevent race conditions and stale closures
-  const hasStartedSynthesisRef = useRef<boolean>(false);
   const activeStreamCleanupRef = useRef<(() => void) | null>(null);
   const isMountedRef = useRef<boolean>(true);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
 
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -209,8 +217,49 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
         activeStreamCleanupRef.current();
         activeStreamCleanupRef.current = null;
       }
+      // Stop wake word detection
+      wakeWordService.stop();
     };
   }, []);
+
+  // Track recording state for wake word callbacks
+  const isRecordingRef = useRef(isRecording);
+  useEffect(() => {
+    isRecordingRef.current = isRecording;
+  }, [isRecording]);
+
+  // Wake word detection - "Hey Ben" to start, "Gata Ben" to stop
+  useEffect(() => {
+    if (isWakeWordEnabled) {
+      wakeWordService.start({
+        onWakeWord: () => {
+          // Start recording if not already recording and not busy
+          if (!isRecordingRef.current && !isLoading && !isStreaming && !isProcessingAudio) {
+            console.log('[WakeWord] Starting recording from wake word');
+            startRecording(true); // Auto-send when stopped
+          }
+        },
+        onStopWord: () => {
+          // Stop recording and send if currently recording
+          if (isRecordingRef.current) {
+            console.log('[WakeWord] Stopping recording from stop word');
+            stopRecording();
+          }
+        },
+        onError: (error) => {
+          console.error('[WakeWord] Error:', error);
+          setError(error);
+          setIsWakeWordEnabled(false);
+        }
+      });
+    } else {
+      wakeWordService.stop();
+    }
+
+    return () => {
+      // Don't stop here - let the main cleanup handle it
+    };
+  }, [isWakeWordEnabled, isLoading, isStreaming, isProcessingAudio]);
 
   // Load existing messages on mount
   useEffect(() => {
@@ -221,11 +270,18 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
 
   // Load dependency nodes for the idea
   const loadDependencyNodes = async (): Promise<void> => {
-    const state = await window.electronAPI.dependencyNodes.getFullState(ideaId);
-    if (!isMountedRef.current) return;
+    try {
+      setDependencyNodesLoading(true);
+      const state = await window.electronAPI.dependencyNodes.getFullState(ideaId);
+      if (!isMountedRef.current) return;
 
-    setDependencyNodes(state.nodes);
-    setDependencyConnections(state.connections);
+      setDependencyNodes(state.nodes);
+      setDependencyConnections(state.connections);
+    } finally {
+      if (isMountedRef.current) {
+        setDependencyNodesLoading(false);
+      }
+    }
   };
 
   // Handle node position change (drag)
@@ -275,13 +331,25 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
 
   // Load app files for the idea
   const loadAppFiles = async (): Promise<void> => {
-    const files = await window.electronAPI.files.list(ideaId);
-    if (!isMountedRef.current) return;
+    try {
+      setAppLoading(true);
+      const files = await window.electronAPI.files.list(ideaId);
+      if (!isMountedRef.current) return;
 
-    setAppFiles(files);
-    const entryFile = files.find(f => f.isEntryFile) ?? null;
-    setAppEntryFile(entryFile);
+      setAppFiles(files);
+      const entryFile = files.find(f => f.isEntryFile) ?? null;
+      setAppEntryFile(entryFile);
+    } finally {
+      if (isMountedRef.current) {
+        setAppLoading(false);
+      }
+    }
   };
+
+  // Track if we've already started synthesis for new conversation
+  const hasStartedSynthesisRef = useRef<boolean>(false);
+  // Track if messages have been loaded for new conversation auto-start
+  const [messagesLoaded, setMessagesLoaded] = useState<boolean>(false);
 
   // Load messages from database
   const loadMessages = async (): Promise<void> => {
@@ -335,15 +403,7 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
       }
 
       setMessages(allMessages);
-
-      // If there are no user/assistant messages, start synthesis automatically
-      // Use ref to prevent double start from React Strict Mode
-      const hasUserOrAssistant = fullData.messages.some(m => m.role === 'user' || m.role === 'assistant');
-      if (!hasUserOrAssistant && isNewConversation && !hasStartedSynthesisRef.current) {
-        hasStartedSynthesisRef.current = true;
-        // New conversation - start synthesis automatically
-        startSynthesis(allMessages);
-      }
+      setMessagesLoaded(true);
     }
   };
 
@@ -374,36 +434,6 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
     // If user scrolls back to bottom, resume auto-scrolling
     if (isAtBottom) {
       setUserHasScrolled(false);
-    }
-  };
-
-  // Start the synthesis - AI responds to system prompt with a minimal trigger
-  const startSynthesis = async (existingMessages: ChatMessage[]): Promise<void> => {
-    setIsLoading(true);
-    setError(null);
-    setUserHasScrolled(false);
-
-    try {
-      // Add a minimal trigger message for the API
-      const userMessages: Array<{ role: 'user' | 'assistant' | 'system'; content: string }> = [
-        ...existingMessages.map(m => ({ role: m.role, content: m.content })),
-        {
-          role: 'user' as const,
-          content: 'Please synthesize my idea based on the notes provided. Use the read_notes tool to fetch the notes, then create a comprehensive synthesis using the update_synthesis tool.'
-        }
-      ];
-
-      await getSynthesisResponse(userMessages);
-    } catch (err) {
-      if (isMountedRef.current) {
-        const errorMessage = err instanceof Error ? err.message : 'Failed to start synthesis';
-        setError(errorMessage);
-        console.error('Synthesis error:', err);
-      }
-    } finally {
-      if (isMountedRef.current) {
-        setIsLoading(false);
-      }
     }
   };
 
@@ -599,14 +629,24 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
 
                 // Refresh app files after file operations complete
                 if (event.result.success && ['create_file', 'update_file', 'modify_file_lines', 'delete_file', 'set_entry_file'].includes(event.toolName || '')) {
-                  loadAppFiles();
-                  setAppLoading(false);
+                  // Use setTimeout to avoid state update conflicts
+                  setTimeout(() => {
+                    if (isMountedRef.current) {
+                      loadAppFiles();
+                      setAppLoading(false);
+                    }
+                  }, 0);
                 }
 
                 // Refresh dependency nodes after node operations complete
                 if (event.result.success && ['create_dependency_node', 'update_dependency_node', 'delete_dependency_node', 'connect_dependency_nodes', 'disconnect_dependency_nodes'].includes(event.toolName || '')) {
-                  loadDependencyNodes();
-                  setDependencyNodesLoading(false);
+                  // Use setTimeout to avoid state update conflicts
+                  setTimeout(() => {
+                    if (isMountedRef.current) {
+                      loadDependencyNodes();
+                      setDependencyNodesLoading(false);
+                    }
+                  }, 0);
                 }
               }
               break;
@@ -749,6 +789,39 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
     }
   }, [ideaId, conversationId]);
 
+  // Auto-start synthesis for new conversations (triggered by "Synthesize Idea" button)
+  // This runs after messages are loaded and getSynthesisResponse is available
+  useEffect(() => {
+    // Only trigger for new conversations with no user/assistant messages yet
+    if (
+      isNewConversation &&
+      messagesLoaded &&
+      !hasStartedSynthesisRef.current &&
+      !isStreaming &&
+      !isLoading
+    ) {
+      // Check if we only have system message (no actual conversation yet)
+      const hasOnlySystemMessage = messages.length > 0 &&
+        messages.every(m => m.role === 'system');
+
+      if (hasOnlySystemMessage) {
+        hasStartedSynthesisRef.current = true;
+
+        // Initial trigger message for synthesis (not shown in UI)
+        // Claude API requires at least one user message
+        const triggerContent = 'Analizează ideile și fa sinteza lor într-o idee. Nu propune note - doar sintetizează.';
+
+        // Prepare messages including the trigger message (don't add to UI state)
+        const initialMessages = [
+          ...messages.map(m => ({ role: m.role, content: m.content })),
+          { role: 'user' as const, content: triggerContent }
+        ];
+
+        getSynthesisResponse(initialMessages);
+      }
+    }
+  }, [isNewConversation, messagesLoaded, messages, isStreaming, isLoading, getSynthesisResponse, conversationId]);
+
   // Handle sending a message
   const handleSend = async (): Promise<void> => {
     if (!inputValue.trim() || isLoading || isStreaming) return;
@@ -795,6 +868,142 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       handleSend();
+    }
+  };
+
+  // Handle stop/abort streaming
+  const handleStop = async (): Promise<void> => {
+    try {
+      // Clean up any active stream listener
+      if (activeStreamCleanupRef.current) {
+        activeStreamCleanupRef.current();
+        activeStreamCleanupRef.current = null;
+      }
+
+      // Send abort signal to the main process
+      await window.electronAPI.ai.abortSynthesis(ideaId);
+
+      // Reset all loading/streaming states
+      setIsStreaming(false);
+      setIsLoading(false);
+      setIsThinking(false);
+      setAppLoading(false);
+      setDependencyNodesLoading(false);
+      setPanelLoading(false);
+      setCurrentThinkingRound(0);
+      setIsSearching(false);
+
+      // Keep the streaming blocks as they are (partial content is still useful)
+    } catch (err) {
+      console.error('Failed to stop synthesis:', err);
+    }
+  };
+
+  // Track if we should auto-send after recording (for wake word)
+  const autoSendAfterRecordingRef = useRef<boolean>(false);
+
+  // Start voice recording
+  const startRecording = async (autoSend = false): Promise<void> => {
+    try {
+      setError(null);
+      autoSendAfterRecordingRef.current = autoSend;
+
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+      const mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+      audioChunksRef.current = [];
+
+      mediaRecorder.ondataavailable = (event: BlobEvent) => {
+        if (event.data.size > 0) {
+          audioChunksRef.current.push(event.data);
+        }
+      };
+
+      mediaRecorder.onstop = async () => {
+        stream.getTracks().forEach(track => track.stop());
+        await processRecording();
+      };
+
+      mediaRecorderRef.current = mediaRecorder;
+      mediaRecorder.start();
+      setIsRecording(true);
+    } catch (err) {
+      setError('Could not access microphone. Please grant permission.');
+      console.error('Microphone error:', err);
+    }
+  };
+
+  // Stop voice recording
+  const stopRecording = (): void => {
+    if (mediaRecorderRef.current && isRecording) {
+      mediaRecorderRef.current.stop();
+      setIsRecording(false);
+      setIsProcessingAudio(true);
+    }
+  };
+
+  // Process recorded audio through STT
+  const processRecording = async (): Promise<void> => {
+    try {
+      const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
+      const arrayBuffer = await audioBlob.arrayBuffer();
+      const audioData = Array.from(new Uint8Array(arrayBuffer));
+
+      const result = await window.electronAPI.stt.transcribe(audioData, 'audio/webm');
+
+      if (result.text && result.text.trim()) {
+        const transcribedText = result.text.trim();
+
+        // If auto-send is enabled (from wake word), send directly
+        if (autoSendAfterRecordingRef.current) {
+          autoSendAfterRecordingRef.current = false;
+          setIsProcessingAudio(false);
+
+          // Create and send the message directly
+          const userMessage: ChatMessage = {
+            id: crypto.randomUUID(),
+            role: 'user',
+            content: transcribedText,
+            createdAt: new Date()
+          };
+
+          setMessages(prev => [...prev, userMessage]);
+          setIsLoading(true);
+          setUserHasScrolled(false);
+
+          // Save user message to database
+          await window.electronAPI.db.addMessage({
+            conversationId,
+            role: 'user',
+            content: userMessage.content
+          });
+
+          // Get response
+          const allMessages = [...messages, userMessage].map(m => ({
+            role: m.role,
+            content: m.content
+          }));
+
+          await getSynthesisResponse(allMessages);
+          setIsLoading(false);
+        } else {
+          // Normal mode - just append to input
+          setInputValue(prev => {
+            const newValue = prev ? `${prev} ${transcribedText}` : transcribedText;
+            return newValue;
+          });
+          inputRef.current?.focus();
+          setIsProcessingAudio(false);
+        }
+      } else {
+        setIsProcessingAudio(false);
+      }
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : 'Failed to transcribe audio';
+      setError(errorMessage);
+      console.error('Transcription error:', err);
+      setIsProcessingAudio(false);
+      autoSendAfterRecordingRef.current = false;
     }
   };
 
@@ -884,22 +1093,47 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
 
         <h1 className="text-xl font-light text-blue-50">Idea Synthesis</h1>
 
-        {/* Panel toggle button */}
-        <button
-          onClick={() => setPanelOpen(!panelOpen)}
-          className={`flex items-center gap-2 px-3 py-1.5 rounded-lg transition-colors ${
-            panelOpen
-              ? 'bg-sky-500/20 text-sky-400'
-              : 'text-blue-300 hover:text-sky-400 hover:bg-[#1e3a5f]'
-          }`}
-          aria-label="Toggle panel"
-        >
-          <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-                  d="M4 5a1 1 0 011-1h14a1 1 0 011 1v2a1 1 0 01-1 1H5a1 1 0 01-1-1V5zM4 13a1 1 0 011-1h6a1 1 0 011 1v6a1 1 0 01-1 1H5a1 1 0 01-1-1v-6zM16 13a1 1 0 011-1h2a1 1 0 011 1v6a1 1 0 01-1 1h-2a1 1 0 01-1-1v-6z" />
-          </svg>
-          <span className="text-sm">Panel</span>
-        </button>
+        <div className="flex items-center gap-2">
+          {/* Wake word toggle button - "Hey Ben" */}
+          {isWakeWordAvailable && (
+            <button
+              onClick={() => setIsWakeWordEnabled(!isWakeWordEnabled)}
+              className={`flex items-center gap-2 px-3 py-1.5 rounded-lg transition-colors ${
+                isWakeWordEnabled
+                  ? 'bg-emerald-500/20 text-emerald-400'
+                  : 'text-blue-300 hover:text-emerald-400 hover:bg-[#1e3a5f]'
+              }`}
+              aria-label="Toggle voice activation"
+              title={isWakeWordEnabled ? 'Voice active - say "Hey Ben" to start, "Gata Ben" to send' : 'Enable voice activation'}
+            >
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                      d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
+              </svg>
+              <span className="text-sm">Hey Ben</span>
+              {isWakeWordEnabled && (
+                <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+              )}
+            </button>
+          )}
+
+          {/* Panel toggle button */}
+          <button
+            onClick={() => setPanelOpen(!panelOpen)}
+            className={`flex items-center gap-2 px-3 py-1.5 rounded-lg transition-colors ${
+              panelOpen
+                ? 'bg-sky-500/20 text-sky-400'
+                : 'text-blue-300 hover:text-sky-400 hover:bg-[#1e3a5f]'
+            }`}
+            aria-label="Toggle panel"
+          >
+            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                    d="M4 5a1 1 0 011-1h14a1 1 0 011 1v2a1 1 0 01-1 1H5a1 1 0 01-1-1V5zM4 13a1 1 0 011-1h6a1 1 0 011 1v6a1 1 0 01-1 1H5a1 1 0 01-1-1v-6zM16 13a1 1 0 011-1h2a1 1 0 011 1v6a1 1 0 01-1 1h-2a1 1 0 01-1-1v-6z" />
+            </svg>
+            <span className="text-sm">Panel</span>
+          </button>
+        </div>
       </header>
 
       {/* Error message */}
@@ -948,6 +1182,22 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
                           />
                         );
                       } else if (block.type === 'tool_use') {
+                        // Special handling for propose_note - render ProposedNoteBlock
+                        if (block.toolName === 'propose_note' && block.proposal) {
+                          const status = proposalStatuses.get(block.proposal.id);
+                          return (
+                            <ProposedNoteBlock
+                              key={block.id}
+                              proposal={block.proposal}
+                              onAccept={handleAcceptProposal}
+                              onReject={handleRejectProposal}
+                              isProcessing={status?.isProcessing}
+                              isAccepted={status?.isAccepted}
+                              isRejected={status?.isRejected}
+                            />
+                          );
+                        }
+                        // Generic tool block
                         return (
                           <div key={block.id} className="flex items-start gap-2 text-sm">
                             <span className={`px-2 py-0.5 rounded text-xs ${
@@ -1120,6 +1370,7 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
           dependencyConnections={dependencyConnections}
           dependencyNodesLoading={dependencyNodesLoading}
           onNodePositionChange={handleNodePositionChange}
+          ideaId={ideaId}
         />
       </div>
 
@@ -1143,18 +1394,62 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
                        resize-none"
             style={{ minHeight: '48px', maxHeight: '120px' }}
           />
+          {/* Voice input button */}
           <button
-            onClick={handleSend}
-            disabled={!inputValue.trim() || isLoading || isStreaming}
-            className="p-3 rounded-xl bg-sky-500 text-white
-                       hover:bg-sky-400 transition-colors
-                       disabled:opacity-50 disabled:cursor-not-allowed"
+            onClick={isRecording ? stopRecording : startRecording}
+            disabled={isLoading || isStreaming || isProcessingAudio}
+            className={`p-3 rounded-xl transition-colors
+                       ${isRecording
+                         ? 'bg-red-500 text-white animate-pulse'
+                         : isProcessingAudio
+                           ? 'bg-amber-500 text-white'
+                           : 'bg-[#1e3a5f] text-blue-300 hover:bg-[#2a4a6f] hover:text-sky-400'
+                       }
+                       disabled:opacity-50 disabled:cursor-not-allowed`}
+            title={isRecording ? 'Stop recording' : isProcessingAudio ? 'Processing...' : 'Voice input'}
           >
-            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-                    d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" />
-            </svg>
+            {isProcessingAudio ? (
+              <svg className="w-5 h-5 animate-spin" fill="none" viewBox="0 0 24 24">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+              </svg>
+            ) : isRecording ? (
+              <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
+                <rect x="6" y="6" width="12" height="12" rx="2" />
+              </svg>
+            ) : (
+              <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
+                <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z" />
+                <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z" />
+              </svg>
+            )}
           </button>
+          {/* Stop button - shown when streaming/loading */}
+          {(isStreaming || isLoading) ? (
+            <button
+              onClick={handleStop}
+              className="p-3 rounded-xl bg-red-500 text-white
+                         hover:bg-red-400 transition-colors"
+              title="Stop generation"
+            >
+              <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
+                <rect x="6" y="6" width="12" height="12" rx="2" />
+              </svg>
+            </button>
+          ) : (
+            <button
+              onClick={handleSend}
+              disabled={!inputValue.trim()}
+              className="p-3 rounded-xl bg-sky-500 text-white
+                         hover:bg-sky-400 transition-colors
+                         disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                      d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" />
+              </svg>
+            </button>
+          )}
         </div>
       </div>
     </div>

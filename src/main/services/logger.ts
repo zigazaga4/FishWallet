@@ -1,16 +1,13 @@
 import log from 'electron-log/main';
 import * as path from 'path';
 import * as fs from 'fs';
-import { app } from 'electron';
 
 // Initialize electron-log for IPC communication with renderer
 log.initialize();
 
-// Set log directory in user data folder (writable on all platforms)
-// Windows: C:\Users\<user>\AppData\Roaming\FishWallet\logs
-// Linux: ~/.config/FishWallet/logs
-// macOS: ~/Library/Application Support/FishWallet/logs
-const logDir = path.join(app.getPath('userData'), 'logs');
+// Set log directory in project folder for easy access during development
+// All app logs go here along with panel errors
+const logDir = '/Users/mobinedvin/FishWallet/FishWallet/logs';
 
 // Create logs directory if it doesn't exist
 if (!fs.existsSync(logDir)) {

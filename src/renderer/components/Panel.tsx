@@ -69,6 +69,8 @@ interface PanelProps {
   dependencyConnections: DependencyNodeConnection[];
   dependencyNodesLoading: boolean;
   onNodePositionChange?: (nodeId: string, x: number, y: number) => void;
+  // Idea ID for error reporting
+  ideaId: string;
 }
 
 // Floating side panel component
@@ -85,7 +87,8 @@ export function Panel({
   dependencyNodes,
   dependencyConnections,
   dependencyNodesLoading,
-  onNodePositionChange
+  onNodePositionChange,
+  ideaId
 }: PanelProps): ReactElement | null {
   // Preview mode state - desktop, phone, or fullscreen
   const [previewMode, setPreviewMode] = useState<PreviewMode>('desktop');
@@ -266,6 +269,7 @@ export function Panel({
                 allFiles={appFiles}
                 isLoading={appLoading}
                 previewMode={previewMode}
+                ideaId={ideaId}
               />
             </div>
           </div>

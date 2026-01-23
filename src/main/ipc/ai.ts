@@ -5,6 +5,7 @@ import { executeDependencyNodeToolCall } from '../services/aiNodeTools';
 import { ideasService } from '../services/ideas';
 import { dependencyNodesService } from '../services/dependencyNodes';
 import { logger, logStreamEvent, logToolExecution, logAssistantContent, logApiError } from '../services/logger';
+import { formatErrorsForAI, clearPanelErrors, hasPanelErrors } from '../services/panelErrors';
 import Anthropic from '@anthropic-ai/sdk';
 
 // IPC channel names for AI operations
@@ -21,11 +22,47 @@ export const AI_CHANNELS = {
   SYNTHESIS_STREAM: 'ai:synthesis-stream',
   SYNTHESIS_STREAM_EVENT: 'ai:synthesis-stream-event',
   SYNTHESIS_STREAM_END: 'ai:synthesis-stream-end',
-  SYNTHESIS_STREAM_ERROR: 'ai:synthesis-stream-error'
+  SYNTHESIS_STREAM_ERROR: 'ai:synthesis-stream-error',
+  // Abort channel
+  SYNTHESIS_ABORT: 'ai:synthesis-abort'
 } as const;
+
+// Track active streams per idea for abort functionality
+const activeStreams = new Map<string, { aborted: boolean }>();
+
+// Check if stream is aborted
+function isStreamAborted(ideaId: string): boolean {
+  const stream = activeStreams.get(ideaId);
+  return stream?.aborted === true;
+}
+
+// Mark stream as aborted
+function abortStream(ideaId: string): void {
+  const stream = activeStreams.get(ideaId);
+  if (stream) {
+    stream.aborted = true;
+    logger.info('[AI-IPC] Stream aborted for idea:', ideaId);
+  }
+}
+
+// Start tracking a stream
+function startStreamTracking(ideaId: string): void {
+  activeStreams.set(ideaId, { aborted: false });
+}
+
+// Stop tracking a stream
+function stopStreamTracking(ideaId: string): void {
+  activeStreams.delete(ideaId);
+}
 
 // Safety limit for tool rounds (effectively unlimited)
 const MAX_TOOL_ROUNDS = 1000;
+
+// Maximum number of error fixing rounds to prevent infinite loops
+const MAX_ERROR_FIX_ROUNDS = 3;
+
+// Delay to wait for panel errors to be reported (ms)
+const PANEL_ERROR_CHECK_DELAY = 1500;
 
 // Register all AI-related IPC handlers
 export function registerAIHandlers(): void {
@@ -84,6 +121,13 @@ export function registerAIHandlers(): void {
     langChainService.clear();
   });
 
+  // Abort an active synthesis stream
+  ipcMain.handle(AI_CHANNELS.SYNTHESIS_ABORT, async (_event, ideaId: string): Promise<{ success: boolean }> => {
+    logger.info('[AI-IPC] Abort request received for idea:', ideaId);
+    abortStream(ideaId);
+    return { success: true };
+  });
+
   // Synthesis stream with tools - handles the agentic loop
   ipcMain.handle(
     AI_CHANNELS.SYNTHESIS_STREAM,
@@ -132,17 +176,33 @@ export function registerAIHandlers(): void {
           totalMessages: messages.length
         });
 
-        // Process the stream with agentic tool loop (includes all tools)
-        await processAgenticStream(
-          webContents,
-          ideaId,
-          messages,
-          getAllTools()
-        );
+        // Start tracking this stream for abort functionality
+        startStreamTracking(ideaId);
 
-        logger.info('[Synthesis] Stream completed successfully');
-        webContents.send(AI_CHANNELS.SYNTHESIS_STREAM_END);
+        try {
+          // Process the stream with agentic tool loop (includes all tools)
+          await processAgenticStream(
+            webContents,
+            ideaId,
+            messages,
+            getAllTools(),
+            0 // errorFixRound - starts at 0
+          );
+
+          // Check if aborted
+          if (isStreamAborted(ideaId)) {
+            logger.info('[Synthesis] Stream was aborted');
+            webContents.send(AI_CHANNELS.SYNTHESIS_STREAM_END);
+          } else {
+            logger.info('[Synthesis] Stream completed successfully');
+            webContents.send(AI_CHANNELS.SYNTHESIS_STREAM_END);
+          }
+        } finally {
+          // Always clean up stream tracking
+          stopStreamTracking(ideaId);
+        }
       } catch (error) {
+        stopStreamTracking(ideaId);
         const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred';
         logger.error('[Synthesis] Stream error', { error: errorMessage, stack: error instanceof Error ? error.stack : undefined });
         logApiError('Synthesis', error);
@@ -164,19 +224,33 @@ interface StreamResult {
 
 // Process the agentic stream with tool execution loop
 // This maintains the FULL conversation history across all rounds
+// errorFixRound tracks how many times we've tried to fix panel errors
 async function processAgenticStream(
   webContents: Electron.WebContents,
   ideaId: string,
   initialMessages: ChatMessage[],
-  tools: Anthropic.ToolUnion[]
+  tools: Anthropic.ToolUnion[],
+  errorFixRound: number = 0
 ): Promise<void> {
-  logger.info('[Agentic] Starting agentic loop');
+  logger.info('[Agentic] Starting agentic loop', { errorFixRound });
+
+  // Check for abort before starting
+  if (isStreamAborted(ideaId)) {
+    logger.info('[Agentic] Stream aborted before starting');
+    return;
+  }
 
   // Track all conversation turns for full context
   const conversationTurns: ConversationTurn[] = [];
 
   // First round: use chatStreamWithTools
-  const firstResult = await streamFirstRound(webContents, initialMessages, tools);
+  const firstResult = await streamFirstRound(webContents, ideaId, initialMessages, tools);
+
+  // Check for abort after first round
+  if (isStreamAborted(ideaId)) {
+    logger.info('[Agentic] Stream aborted after first round');
+    return;
+  }
 
   logger.info('[Agentic] First round completed', {
     stopReason: firstResult.stopReason,
@@ -187,9 +261,22 @@ async function processAgenticStream(
     contentBlockTypes: firstResult.assistantContent.map(b => b.type)
   });
 
-  // If no tool calls, we're done
+  // If no tool calls, check for panel errors before ending
   if (firstResult.stopReason !== 'tool_use' || firstResult.toolCalls.length === 0) {
-    logger.info('[Agentic] No tool calls, ending loop');
+    logger.info('[Agentic] No tool calls, checking for panel errors before ending');
+    await checkAndHandlePanelErrors(
+      webContents,
+      ideaId,
+      initialMessages,
+      tools,
+      errorFixRound
+    );
+    return;
+  }
+
+  // Check for abort before executing tools
+  if (isStreamAborted(ideaId)) {
+    logger.info('[Agentic] Stream aborted before tool execution');
     return;
   }
 
@@ -222,13 +309,88 @@ async function processAgenticStream(
     initialMessages,
     conversationTurns,
     tools,
-    1 // round number
+    1, // round number
+    errorFixRound
+  );
+}
+
+// Check for panel errors and start a new agentic round to fix them if needed
+async function checkAndHandlePanelErrors(
+  webContents: Electron.WebContents,
+  ideaId: string,
+  previousMessages: ChatMessage[],
+  tools: Anthropic.ToolUnion[],
+  errorFixRound: number
+): Promise<void> {
+  // Check for abort
+  if (isStreamAborted(ideaId)) {
+    logger.info('[PanelErrorFix] Stream aborted, skipping error check');
+    return;
+  }
+
+  // Don't check for errors if we've already tried to fix too many times
+  if (errorFixRound >= MAX_ERROR_FIX_ROUNDS) {
+    logger.warn('[PanelErrorFix] Max error fix rounds reached, not checking for more errors', {
+      errorFixRound,
+      maxRounds: MAX_ERROR_FIX_ROUNDS
+    });
+    return;
+  }
+
+  // Wait for panel to render and report any errors
+  logger.info('[PanelErrorFix] Waiting for panel errors to be reported');
+  await new Promise(resolve => setTimeout(resolve, PANEL_ERROR_CHECK_DELAY));
+
+  // Check for abort after waiting
+  if (isStreamAborted(ideaId)) {
+    logger.info('[PanelErrorFix] Stream aborted during error check wait');
+    return;
+  }
+
+  // Check if there are any panel errors
+  if (!hasPanelErrors(ideaId)) {
+    logger.info('[PanelErrorFix] No panel errors found');
+    return;
+  }
+
+  // Get formatted error message for AI
+  const errorMessage = formatErrorsForAI(ideaId);
+  if (!errorMessage) {
+    logger.info('[PanelErrorFix] No error message formatted (errors may have been cleared)');
+    return;
+  }
+
+  logger.info('[PanelErrorFix] Panel errors detected, starting fix round', {
+    errorFixRound: errorFixRound + 1,
+    errorMessage: errorMessage.substring(0, 200) + '...'
+  });
+
+  // Clear the errors now that we're going to fix them
+  clearPanelErrors(ideaId);
+
+  // Add the error message as a new user message
+  const messagesWithError: ChatMessage[] = [
+    ...previousMessages,
+    {
+      role: 'user',
+      content: errorMessage
+    }
+  ];
+
+  // Start a new agentic round to fix the errors
+  await processAgenticStream(
+    webContents,
+    ideaId,
+    messagesWithError,
+    tools,
+    errorFixRound + 1
   );
 }
 
 // Stream the first round using chatStreamWithTools
 async function streamFirstRound(
   webContents: Electron.WebContents,
+  ideaId: string,
   messages: ChatMessage[],
   tools: Anthropic.ToolUnion[]
 ): Promise<StreamResult> {
@@ -289,8 +451,15 @@ async function processContinuationRounds(
   baseMessages: ChatMessage[],
   conversationTurns: ConversationTurn[],
   tools: Anthropic.ToolUnion[],
-  roundNumber: number
+  roundNumber: number,
+  errorFixRound: number = 0
 ): Promise<void> {
+  // Check for abort at start of round
+  if (isStreamAborted(ideaId)) {
+    logger.info('[Continuation] Stream aborted, stopping continuation rounds');
+    return;
+  }
+
   logger.info(`[Continuation] Starting round ${roundNumber + 1}`);
 
   if (roundNumber >= MAX_TOOL_ROUNDS) {
@@ -311,10 +480,17 @@ async function processContinuationRounds(
   // Stream continuation response with FULL conversation history
   const result = await streamContinuationWithFullHistory(
     webContents,
+    ideaId,
     baseMessages,
     conversationTurns,
     tools
   );
+
+  // Check for abort after streaming
+  if (isStreamAborted(ideaId)) {
+    logger.info('[Continuation] Stream aborted after continuation stream');
+    return;
+  }
 
   logger.info(`[Continuation] Round ${roundNumber + 1} completed`, {
     stopReason: result.stopReason,
@@ -324,9 +500,16 @@ async function processContinuationRounds(
     contentBlockTypes: result.assistantContent.map(b => b.type)
   });
 
-  // If no more tool calls, we're done
+  // If no more tool calls, check for panel errors before ending
   if (result.stopReason !== 'tool_use' || result.toolCalls.length === 0) {
-    logger.info('[Continuation] No more tool calls, ending loop');
+    logger.info('[Continuation] No more tool calls, checking for panel errors');
+    await checkAndHandlePanelErrors(
+      webContents,
+      ideaId,
+      baseMessages,
+      tools,
+      errorFixRound
+    );
     return;
   }
 
@@ -358,7 +541,8 @@ async function processContinuationRounds(
     baseMessages,
     conversationTurns,
     tools,
-    roundNumber + 1
+    roundNumber + 1,
+    errorFixRound
   );
 }
 
@@ -366,6 +550,7 @@ async function processContinuationRounds(
 // This properly includes ALL previous thinking blocks as required by API
 async function streamContinuationWithFullHistory(
   webContents: Electron.WebContents,
+  ideaId: string,
   baseMessages: ChatMessage[],
   conversationTurns: ConversationTurn[],
   tools: Anthropic.ToolUnion[]
@@ -388,6 +573,11 @@ async function streamContinuationWithFullHistory(
       conversationTurns,
       tools
     )) {
+      // Check for abort during streaming
+      if (isStreamAborted(ideaId)) {
+        logger.info('[ContinuationStream] Stream aborted during streaming');
+        break;
+      }
       // Log each stream event (skip tool_input_delta for verbosity, just count them)
       if (streamEvent.type === 'tool_input_delta') {
         // Log periodically to avoid spam

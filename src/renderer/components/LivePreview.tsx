@@ -28,6 +28,7 @@ interface LivePreviewProps {
   allFiles: ProjectFile[];
   isLoading: boolean;
   previewMode?: PreviewMode;
+  ideaId: string; // Required to associate errors with the idea
 }
 
 // Package mapping: npm package name -> global variable name
@@ -255,6 +256,7 @@ function generateIframeHtml(
       ${safeCode}
     } catch (err) {
       console.error('Module ${i + 1} error:', err);
+      reportErrorToParent('Module ${i + 1} error: ' + (err.message || err), err.stack);
     }`;
   }).join('\n');
 
@@ -268,14 +270,45 @@ function generateIframeHtml(
     // Initialize module registry
     window.__MODULES__ = {};
 
-    // Global error handler
+    // Report error to parent window with full details
+    function reportErrorToParent(message, stack, source, line, column) {
+      if (window.parent !== window) {
+        window.parent.postMessage({
+          type: 'panel-error',
+          message: String(message),
+          source: source || undefined,
+          line: line || undefined,
+          column: column || undefined,
+          stack: stack || undefined
+        }, '*');
+      }
+    }
+
+    // Global error handler - reports to parent window
+    // Note: Cross-origin errors show as "Script error." - use try-catch for details
     window.onerror = function(msg, url, line, col, error) {
-      showError('Runtime Error: ' + msg + (line ? ' (line ' + line + ')' : ''));
+      var errorMsg = String(msg);
+      var errorStack = error?.stack || undefined;
+
+      // If we get "Script error." it means the error was from cross-origin
+      // The actual error should have been caught by try-catch blocks
+      if (errorMsg === 'Script error.' || errorMsg === 'Script error') {
+        // Still show it but note it's a cross-origin error
+        errorMsg = 'Script error (cross-origin - see try-catch for details)';
+      }
+
+      showError('Runtime Error: ' + errorMsg + (line ? ' (line ' + line + ')' : ''));
+      reportErrorToParent(errorMsg, errorStack, url, line, col);
       return true;
     };
+
     window.onunhandledrejection = function(event) {
-      showError('Unhandled Promise: ' + (event.reason?.message || event.reason));
+      var errorMsg = 'Unhandled Promise: ' + (event.reason?.message || event.reason);
+      var errorStack = event.reason?.stack || undefined;
+      showError(errorMsg);
+      reportErrorToParent(errorMsg, errorStack);
     };
+
     function showError(message) {
       var container = document.getElementById('error-container');
       if (container) {
@@ -283,6 +316,7 @@ function generateIframeHtml(
         container.style.display = 'block';
       }
     }
+
     function escapeHtml(text) {
       var div = document.createElement('div');
       div.textContent = text;
@@ -322,42 +356,95 @@ function generateIframeHtml(
 <body>
   <div id="root"></div>
   <div id="error-container"></div>
-  <script type="text/babel" data-presets="react,typescript">
-    // Destructure React hooks for convenience
-    const { useState, useEffect, useCallback, useMemo, useRef, useContext, useReducer, createContext, forwardRef, memo, lazy, Suspense, Fragment } = React;
+  <script>
+    // Wait for Babel to load, then transform and execute code manually
+    // This allows us to catch both transformation and runtime errors
+    function executeWithBabel() {
+      // Destructure React hooks for convenience
+      var useState = React.useState;
+      var useEffect = React.useEffect;
+      var useCallback = React.useCallback;
+      var useMemo = React.useMemo;
+      var useRef = React.useRef;
+      var useContext = React.useContext;
+      var useReducer = React.useReducer;
+      var createContext = React.createContext;
+      var forwardRef = React.forwardRef;
+      var memo = React.memo;
+      var lazy = React.lazy;
+      var Suspense = React.Suspense;
+      var Fragment = React.Fragment;
 
-    // Framer motion shortcuts
-    const { motion, AnimatePresence } = window.FramerMotion || {};
+      // Framer motion shortcuts
+      var motion = window.FramerMotion ? window.FramerMotion.motion : undefined;
+      var AnimatePresence = window.FramerMotion ? window.FramerMotion.AnimatePresence : undefined;
 
-    // Error boundary
-    class ErrorBoundary extends React.Component {
-      constructor(props) {
-        super(props);
-        this.state = { hasError: false, error: null };
-      }
-      static getDerivedStateFromError(error) {
-        return { hasError: true, error };
-      }
-      render() {
-        if (this.state.hasError) {
-          return React.createElement('div', { className: 'error-display' },
-            this.state.error?.message || String(this.state.error)
-          );
+      // Error boundary - catches React render errors
+      class ErrorBoundary extends React.Component {
+        constructor(props) {
+          super(props);
+          this.state = { hasError: false, error: null };
         }
-        return this.props.children;
+        static getDerivedStateFromError(error) {
+          return { hasError: true, error };
+        }
+        componentDidCatch(error, errorInfo) {
+          var errorMsg = 'React Render Error: ' + (error.message || String(error));
+          var errorStack = error.stack || (errorInfo ? errorInfo.componentStack : undefined);
+          reportErrorToParent(errorMsg, errorStack);
+        }
+        render() {
+          if (this.state.hasError) {
+            return React.createElement('div', { className: 'error-display' },
+              this.state.error?.message || String(this.state.error)
+            );
+          }
+          return this.props.children;
+        }
+      }
+      window.ErrorBoundary = ErrorBoundary;
+
+      // Transform and execute code with error handling
+      function transformAndExecute(code, name) {
+        try {
+          var transformed = Babel.transform(code, {
+            presets: ['react', 'typescript'],
+            filename: name + '.tsx'
+          });
+          eval(transformed.code);
+        } catch (err) {
+          var errorMsg = name + ' error: ' + (err.message || String(err));
+          console.error(errorMsg, err);
+          reportErrorToParent(errorMsg, err.stack);
+          showError(errorMsg);
+          throw err; // Re-throw to stop execution
+        }
+      }
+
+      // Module code
+      var moduleCode = ${JSON.stringify(moduleCode)};
+
+      // Execute modules
+      for (var i = 0; i < moduleCode.length; i++) {
+        if (moduleCode[i].trim()) {
+          transformAndExecute(moduleCode[i], 'Module ' + (i + 1));
+        }
+      }
+
+      // Entry file code
+      var entryCode = ${JSON.stringify(entryCode)};
+
+      // Execute entry file
+      if (entryCode.trim()) {
+        transformAndExecute(entryCode, 'Entry file');
       }
     }
 
-    // Load all modules first
-    ${moduleScripts}
-
-    // Then run entry file
-    try {
-      ${safeEntryJs}
-    } catch (err) {
-      console.error('Entry file error:', err);
-      document.getElementById('error-container').innerHTML = '<div class="error-display">' + (err.message || err) + '</div>';
-      document.getElementById('error-container').style.display = 'block';
+    // Run after DOM is ready
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', executeWithBabel);
+    } else {
+      executeWithBabel();
     }
   <\/script>
 </body>
@@ -365,11 +452,43 @@ function generateIframeHtml(
 }
 
 // LivePreview component
-export function LivePreview({ entryFile, allFiles, isLoading, previewMode = 'desktop' }: LivePreviewProps): ReactElement {
+export function LivePreview({ entryFile, allFiles, isLoading, previewMode = 'desktop', ideaId }: LivePreviewProps): ReactElement {
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const [iframeKey, setIframeKey] = useState(0);
   const [preloadBundle, setPreloadBundle] = useState<string | null>(null);
   const [preloadError, setPreloadError] = useState<string | null>(null);
+
+  // Listen for error messages from the iframe
+  useEffect(() => {
+    function handleMessage(event: MessageEvent) {
+      // Only handle panel-error messages
+      if (event.data?.type !== 'panel-error') return;
+
+      const { message, source, line, column, stack } = event.data;
+
+      // Report the error to the main process for logging and AI feedback
+      window.electronAPI.panelErrors.report(
+        ideaId,
+        message,
+        source,
+        line,
+        column,
+        stack
+      ).catch((err) => {
+        console.error('[LivePreview] Failed to report panel error:', err);
+      });
+    }
+
+    window.addEventListener('message', handleMessage);
+    return () => window.removeEventListener('message', handleMessage);
+  }, [ideaId]);
+
+  // Clear previous errors when files change (new render attempt)
+  useEffect(() => {
+    if (entryFile) {
+      window.electronAPI.panelErrors.clear(ideaId).catch(() => {});
+    }
+  }, [entryFile, allFiles, ideaId]);
 
   // Load the preload bundle on mount
   useEffect(() => {
@@ -486,7 +605,8 @@ export function LivePreview({ entryFile, allFiles, isLoading, previewMode = 'des
   const css = extractCss(allFiles);
 
   // Generate HTML with all modules
-  const html = generateIframeHtml(moduleCode, entryCode, css, preloadBundle);
+  // preloadBundle is guaranteed to be non-null here due to early returns above
+  const html = generateIframeHtml(moduleCode, entryCode, css, preloadBundle!);
 
   // Phone mode: constrained to phone dimensions, centered
   if (previewMode === 'phone') {

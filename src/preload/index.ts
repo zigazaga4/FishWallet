@@ -14,7 +14,8 @@ const AI_CHANNELS = {
   SYNTHESIS_STREAM: 'ai:synthesis-stream',
   SYNTHESIS_STREAM_EVENT: 'ai:synthesis-stream-event',
   SYNTHESIS_STREAM_END: 'ai:synthesis-stream-end',
-  SYNTHESIS_STREAM_ERROR: 'ai:synthesis-stream-error'
+  SYNTHESIS_STREAM_ERROR: 'ai:synthesis-stream-error',
+  SYNTHESIS_ABORT: 'ai:synthesis-abort'
 } as const;
 
 // File builder IPC channel names (must match main process)
@@ -275,6 +276,26 @@ interface DependencyNodesStreamEvent {
   proposal?: { id: string; title: string; content: string; category: string; ideaId: string };
 }
 
+// Panel error interface
+interface PanelError {
+  timestamp: Date;
+  ideaId: string;
+  message: string;
+  source?: string;
+  line?: number;
+  column?: number;
+  stack?: string;
+}
+
+// Panel error IPC channel names
+const PANEL_ERROR_CHANNELS = {
+  REPORT_ERROR: 'panel-errors:report',
+  GET_ERRORS: 'panel-errors:get',
+  CLEAR_ERRORS: 'panel-errors:clear',
+  HAS_ERRORS: 'panel-errors:has',
+  GET_LOG_PATH: 'panel-errors:log-path'
+} as const;
+
 // Expose protected methods that allow the renderer process to use
 // ipcRenderer without exposing the entire object
 contextBridge.exposeInMainWorld('electronAPI', {
@@ -340,6 +361,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
         ipcRenderer.removeListener(AI_CHANNELS.SYNTHESIS_STREAM_END, endHandler);
         ipcRenderer.removeListener(AI_CHANNELS.SYNTHESIS_STREAM_ERROR, errorHandler);
       });
+    },
+
+    // Abort an active synthesis stream
+    abortSynthesis: (ideaId: string): Promise<{ success: boolean }> => {
+      return ipcRenderer.invoke(AI_CHANNELS.SYNTHESIS_ABORT, ideaId);
     }
   },
 
@@ -625,6 +651,32 @@ contextBridge.exposeInMainWorld('electronAPI', {
     disconnect: (): Promise<{ success: boolean; error?: string }> => {
       return ipcRenderer.invoke('mcp:disconnect');
     }
+  },
+
+  // Panel errors API - for reporting and retrieving iframe runtime errors
+  panelErrors: {
+    report: (
+      ideaId: string,
+      message: string,
+      source?: string,
+      line?: number,
+      column?: number,
+      stack?: string
+    ): Promise<void> => {
+      return ipcRenderer.invoke(PANEL_ERROR_CHANNELS.REPORT_ERROR, ideaId, message, source, line, column, stack);
+    },
+    get: (ideaId: string): Promise<PanelError[]> => {
+      return ipcRenderer.invoke(PANEL_ERROR_CHANNELS.GET_ERRORS, ideaId);
+    },
+    clear: (ideaId: string): Promise<void> => {
+      return ipcRenderer.invoke(PANEL_ERROR_CHANNELS.CLEAR_ERRORS, ideaId);
+    },
+    has: (ideaId: string): Promise<boolean> => {
+      return ipcRenderer.invoke(PANEL_ERROR_CHANNELS.HAS_ERRORS, ideaId);
+    },
+    getLogPath: (): Promise<string> => {
+      return ipcRenderer.invoke(PANEL_ERROR_CHANNELS.GET_LOG_PATH);
+    }
   }
 });
 
@@ -651,6 +703,7 @@ declare global {
           onEnd: () => void,
           onError: (error: string) => void
         ) => Promise<() => void>;
+        abortSynthesis: (ideaId: string) => Promise<{ success: boolean }>;
       };
       db: {
         createConversation: (data: { title: string; systemPrompt?: string; model?: string }) => Promise<Conversation>;
@@ -765,6 +818,20 @@ declare global {
         scrape: (url: string, options?: { formats?: string[]; onlyMainContent?: boolean }) => Promise<{ success: boolean; data?: unknown; error?: string }>;
         map: (url: string, options?: { limit?: number; search?: string }) => Promise<{ success: boolean; data?: unknown; error?: string }>;
         disconnect: () => Promise<{ success: boolean; error?: string }>;
+      };
+      panelErrors: {
+        report: (
+          ideaId: string,
+          message: string,
+          source?: string,
+          line?: number,
+          column?: number,
+          stack?: string
+        ) => Promise<void>;
+        get: (ideaId: string) => Promise<PanelError[]>;
+        clear: (ideaId: string) => Promise<void>;
+        has: (ideaId: string) => Promise<boolean>;
+        getLogPath: () => Promise<string>;
       };
     };
   }
