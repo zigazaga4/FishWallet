@@ -7,12 +7,13 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { LivePreview } from './LivePreview';
 import { DependencyNodesView } from './DependencyNodesView';
+import { IdeaStatistics } from './IdeaStatistics';
 
 // Preview mode type - desktop (default), phone (constrained dimensions), or fullscreen (expanded)
 export type PreviewMode = 'desktop' | 'phone' | 'fullscreen';
 
 // Panel tab types
-export type PanelTab = 'main-idea' | 'dependency-nodes' | 'app';
+export type PanelTab = 'main-idea' | 'dependency-nodes' | 'app' | 'statistics';
 
 // Project file interface
 interface ProjectFile {
@@ -48,7 +49,15 @@ interface DependencyNodeConnection {
   fromNodeId: string;
   toNodeId: string;
   label: string | null;
+  details: string | null;
   createdAt: Date;
+}
+
+// Streaming tokens for live statistics
+export interface StreamingTokens {
+  input: number;
+  output: number;
+  isStreaming: boolean;
 }
 
 // Panel props
@@ -71,6 +80,10 @@ interface PanelProps {
   onNodePositionChange?: (nodeId: string, x: number, y: number) => void;
   // Idea ID for error reporting
   ideaId: string;
+  // Conversation ID for statistics
+  conversationId: string | null;
+  // Live streaming tokens for statistics
+  streamingTokens?: StreamingTokens;
 }
 
 // Floating side panel component
@@ -88,7 +101,9 @@ export function Panel({
   dependencyConnections,
   dependencyNodesLoading,
   onNodePositionChange,
-  ideaId
+  ideaId,
+  conversationId,
+  streamingTokens
 }: PanelProps): ReactElement | null {
   // Preview mode state - desktop, phone, or fullscreen
   const [previewMode, setPreviewMode] = useState<PreviewMode>('desktop');
@@ -274,6 +289,16 @@ export function Panel({
             </div>
           </div>
         );
+
+      case 'statistics':
+        // Statistics tab - Cost and usage analytics
+        return (
+          <IdeaStatistics
+            ideaId={ideaId}
+            conversationId={conversationId}
+            streamingTokens={streamingTokens}
+          />
+        );
     }
   };
 
@@ -341,6 +366,16 @@ export function Panel({
               }`}
             >
               App
+            </button>
+            <button
+              onClick={() => onTabChange('statistics')}
+              className={`px-3 py-1.5 text-sm rounded-lg transition-colors ${
+                activeTab === 'statistics'
+                  ? 'bg-sky-500/20 text-sky-400 font-medium'
+                  : 'text-blue-300 hover:text-blue-100 hover:bg-[#1e3a5f]'
+              }`}
+            >
+              Stats
             </button>
           </div>
         </div>

@@ -40,6 +40,15 @@ export interface DependencyNode {
   updatedAt: Date;
 }
 
+// Connection technical details structure
+export interface ConnectionDetails {
+  integrationMethod: string;      // How they connect: "REST API", "SDK", "Database query", "WebSocket", etc.
+  dataFlow: string;               // What data passes: "User authentication tokens", "Payment details", etc.
+  protocol: string;               // Protocol: "HTTPS", "WSS", "gRPC", "TCP", etc.
+  sdkLibraries?: string;          // Required SDKs/libraries: "@stripe/stripe-js", "pg", etc.
+  technicalNotes: string;         // Explanation for developer on how to implement
+}
+
 // Dependency node connection type (maps from database ApiNodeConnection)
 export interface DependencyNodeConnection {
   id: string;
@@ -47,6 +56,7 @@ export interface DependencyNodeConnection {
   fromNodeId: string;
   toNodeId: string;
   label: string | null;
+  details: string | null;         // JSON string of ConnectionDetails
   createdAt: Date;
 }
 
@@ -75,6 +85,7 @@ function mapToDependencyNodeConnection(dbConn: ApiNodeConnection): DependencyNod
     fromNodeId: dbConn.fromNodeId,
     toNodeId: dbConn.toNodeId,
     label: dbConn.label,
+    details: dbConn.details,
     createdAt: dbConn.createdAt
   };
 }
@@ -204,6 +215,7 @@ export class DependencyNodesService {
     fromNodeId: string;
     toNodeId: string;
     label?: string;
+    details?: ConnectionDetails;
   }): DependencyNodeConnection {
     const db = getDatabase();
     const now = this.now();
@@ -228,6 +240,7 @@ export class DependencyNodesService {
       fromNodeId: data.fromNodeId,
       toNodeId: data.toNodeId,
       label: data.label ?? null,
+      details: data.details ? JSON.stringify(data.details) : null,
       createdAt: now
     };
 
@@ -272,20 +285,44 @@ export class DependencyNodesService {
     return { incoming, outgoing };
   }
 
-  // Update a connection label
-  updateConnectionLabel(id: string, label: string): DependencyNodeConnection {
+  // Update a connection (label and/or details)
+  updateConnection(id: string, data: {
+    label?: string;
+    details?: ConnectionDetails;
+  }): DependencyNodeConnection {
     const db = getDatabase();
 
-    db.update(schema.apiNodeConnections)
-      .set({ label })
-      .where(eq(schema.apiNodeConnections.id, id))
-      .run();
+    const updateData: Record<string, unknown> = {};
+    if (data.label !== undefined) updateData.label = data.label;
+    if (data.details !== undefined) updateData.details = JSON.stringify(data.details);
+
+    if (Object.keys(updateData).length > 0) {
+      db.update(schema.apiNodeConnections)
+        .set(updateData)
+        .where(eq(schema.apiNodeConnections.id, id))
+        .run();
+    }
 
     const updated = this.getConnection(id);
     if (!updated) {
       throw new Error(`Connection with id ${id} not found`);
     }
     return updated;
+  }
+
+  // Update a connection label (backwards compatibility)
+  updateConnectionLabel(id: string, label: string): DependencyNodeConnection {
+    return this.updateConnection(id, { label });
+  }
+
+  // Parse connection details from a connection
+  parseConnectionDetails(connection: DependencyNodeConnection): ConnectionDetails | null {
+    if (!connection.details) return null;
+    try {
+      return JSON.parse(connection.details) as ConnectionDetails;
+    } catch {
+      return null;
+    }
   }
 
   // Delete a connection

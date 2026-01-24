@@ -49,6 +49,12 @@ export interface WebSearchResultItem {
   snippet: string;
 }
 
+// Token usage from API response
+export interface TokenUsage {
+  inputTokens: number;
+  outputTokens: number;
+}
+
 export type StreamEvent =
   | { type: 'thinking_start' }
   | { type: 'thinking'; content: string }
@@ -59,7 +65,7 @@ export type StreamEvent =
   | { type: 'tool_use'; toolCall: ToolCall }
   | { type: 'web_search'; toolId: string; searchQuery: string }
   | { type: 'web_search_result'; toolId: string; searchResults: WebSearchResultItem[] }
-  | { type: 'done'; stopReason: string; thinkingData?: ThinkingData };
+  | { type: 'done'; stopReason: string; thinkingData?: ThinkingData; usage?: TokenUsage };
 
 // Conversation turn for multi-round tool use
 // Tracks one assistant response + the tool results for that response
@@ -367,10 +373,17 @@ export class LangChainService {
         // End of message
       } else if (event.type === 'message_delta') {
         if (event.delta.stop_reason) {
+          // Capture usage from the delta event (handle null values)
+          const usage = event.usage ? {
+            inputTokens: event.usage.input_tokens ?? 0,
+            outputTokens: event.usage.output_tokens
+          } : undefined;
+
           yield {
             type: 'done',
             stopReason: event.delta.stop_reason,
-            thinkingData: thinkingContent ? { content: thinkingContent, signature: thinkingSignature } : undefined
+            thinkingData: thinkingContent ? { content: thinkingContent, signature: thinkingSignature } : undefined,
+            usage
           };
         }
       }
@@ -540,10 +553,17 @@ export class LangChainService {
         }
       } else if (event.type === 'message_delta') {
         if (event.delta.stop_reason) {
+          // Capture usage from the delta event (handle null values)
+          const usage = event.usage ? {
+            inputTokens: event.usage.input_tokens ?? 0,
+            outputTokens: event.usage.output_tokens
+          } : undefined;
+
           yield {
             type: 'done',
             stopReason: event.delta.stop_reason,
-            thinkingData: thinkingContent ? { content: thinkingContent, signature: thinkingSignature } : undefined
+            thinkingData: thinkingContent ? { content: thinkingContent, signature: thinkingSignature } : undefined,
+            usage
           };
         }
       }

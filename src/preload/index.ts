@@ -72,6 +72,8 @@ interface SynthesisStreamEvent {
   searchResults?: WebSearchResultItem[];
   // Note proposal fields
   proposal?: ProposedNote;
+  // Token usage (from done event)
+  usage?: { inputTokens: number; outputTokens: number };
 }
 
 // Database IPC channel names (must match main process)
@@ -258,6 +260,7 @@ interface DependencyNodeConnection {
   fromNodeId: string;
   toNodeId: string;
   label: string | null;
+  details: string | null;
   createdAt: Date;
 }
 
@@ -295,6 +298,7 @@ const PANEL_ERROR_CHANNELS = {
   HAS_ERRORS: 'panel-errors:has',
   GET_LOG_PATH: 'panel-errors:log-path'
 } as const;
+
 
 // Expose protected methods that allow the renderer process to use
 // ipcRenderer without exposing the entire object

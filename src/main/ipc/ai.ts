@@ -220,6 +220,8 @@ interface StreamResult {
   textContent: string;
   thinkingContent: string;
   thinkingSignature?: string;
+  inputTokens: number;
+  outputTokens: number;
 }
 
 // Process the agentic stream with tool execution loop
@@ -402,7 +404,9 @@ async function streamFirstRound(
     assistantContent: [],
     textContent: '',
     thinkingContent: '',
-    thinkingSignature: undefined
+    thinkingSignature: undefined,
+    inputTokens: 0,
+    outputTokens: 0
   };
 
   // Stream the response
@@ -563,7 +567,9 @@ async function streamContinuationWithFullHistory(
     assistantContent: [],
     textContent: '',
     thinkingContent: '',
-    thinkingSignature: undefined
+    thinkingSignature: undefined,
+    inputTokens: 0,
+    outputTokens: 0
   };
 
   try {
@@ -653,6 +659,15 @@ function collectStreamEventData(streamEvent: StreamEvent, result: StreamResult):
       if (streamEvent.thinkingData?.signature) {
         result.thinkingSignature = streamEvent.thinkingData.signature;
         logger.debug('[CollectData] Captured thinking signature from done event');
+      }
+      // Capture token usage
+      if (streamEvent.usage) {
+        result.inputTokens += streamEvent.usage.inputTokens;
+        result.outputTokens += streamEvent.usage.outputTokens;
+        logger.debug('[CollectData] Captured token usage', {
+          inputTokens: streamEvent.usage.inputTokens,
+          outputTokens: streamEvent.usage.outputTokens
+        });
       }
       break;
   }

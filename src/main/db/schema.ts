@@ -147,6 +147,8 @@ export const apiNodeConnections = sqliteTable('api_node_connections', {
   toNodeId: text('to_node_id').notNull().references(() => apiNodes.id, { onDelete: 'cascade' }),
   // Connection label (e.g., "sends data", "triggers")
   label: text('label'),
+  // Technical integration details (JSON) - how they connect, data flow, SDKs, protocol
+  details: text('details'),
   createdAt: integer('created_at', { mode: 'timestamp' }).notNull()
 });
 

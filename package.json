@@ -40,6 +40,8 @@
     "@langchain/core": "^1.1.15",
     "@mendable/firecrawl-js": "^4.11.3",
     "@modelcontextprotocol/sdk": "^1.25.3",
+    "@picovoice/porcupine-web": "^4.0.0",
+    "@picovoice/web-voice-processor": "^4.0.9",
     "@types/three": "^0.182.0",
     "axios": "^1.13.2",
     "better-sqlite3": "^12.6.2",

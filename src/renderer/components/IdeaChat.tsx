@@ -77,6 +77,8 @@ interface StreamEvent {
   searchResults?: SearchResultItem[];
   // Note proposal fields (note_proposal event)
   proposal?: ProposedNote;
+  // Token usage (from done event)
+  usage?: { inputTokens: number; outputTokens: number };
 }
 
 // Project file interface
@@ -113,6 +115,7 @@ interface DependencyNodeConnection {
   fromNodeId: string;
   toNodeId: string;
   label: string | null;
+  details: string | null;
   createdAt: Date;
 }
 
@@ -164,6 +167,7 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
   const [inputValue, setInputValue] = useState<string>('');
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [isStreaming, setIsStreaming] = useState<boolean>(false);
+  const [liveStreamingTokens, setLiveStreamingTokens] = useState<{ input: number; output: number }>({ input: 0, output: 0 });
   const [isThinking, setIsThinking] = useState<boolean>(false);
   const [currentThinkingRound, setCurrentThinkingRound] = useState<number>(0);
   const [isSearching, setIsSearching] = useState<boolean>(false);
@@ -197,6 +201,9 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
   const [isWakeWordEnabled, setIsWakeWordEnabled] = useState<boolean>(false);
   const [isWakeWordAvailable] = useState<boolean>(wakeWordService.isAvailable());
 
+  // Ref to accumulate tokens during streaming (for saving to database)
+  const streamTokensRef = useRef<{ input: number; output: number }>({ input: 0, output: 0 });
+
   // Use refs to prevent race conditions and stale closures
   const activeStreamCleanupRef = useRef<(() => void) | null>(null);
   const isMountedRef = useRef<boolean>(true);
@@ -218,7 +225,7 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
         activeStreamCleanupRef.current = null;
       }
       // Stop wake word detection
-      wakeWordService.stop();
+      wakeWordService.stop().catch(() => {/* ignore cleanup errors */});
     };
   }, []);
 
@@ -228,35 +235,47 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
     isRecordingRef.current = isRecording;
   }, [isRecording]);
 
-  // Wake word detection - "Hey Ben" to start, "Gata Ben" to stop
+  // Wake word detection - "JARVIS" to activate voice input
   useEffect(() => {
-    if (isWakeWordEnabled) {
-      wakeWordService.start({
-        onWakeWord: () => {
-          // Start recording if not already recording and not busy
-          if (!isRecordingRef.current && !isLoading && !isStreaming && !isProcessingAudio) {
-            console.log('[WakeWord] Starting recording from wake word');
-            startRecording(true); // Auto-send when stopped
+    let mounted = true;
+
+    const setupWakeWord = async () => {
+      if (isWakeWordEnabled) {
+        const success = await wakeWordService.start({
+          onWakeWord: () => {
+            // Start recording if not already recording and not busy
+            if (!isRecordingRef.current && !isLoading && !isStreaming && !isProcessingAudio) {
+              console.log('[WakeWord] Starting recording from wake word');
+              startRecording(true); // Auto-send when stopped
+            }
+          },
+          onStopWord: () => {
+            // Stop recording and send if currently recording
+            if (isRecordingRef.current) {
+              console.log('[WakeWord] Stopping recording from stop word');
+              stopRecording();
+            }
+          },
+          onError: (error) => {
+            console.error('[WakeWord] Error:', error);
+            if (mounted) {
+              setError(error);
+              setIsWakeWordEnabled(false);
+            }
           }
-        },
-        onStopWord: () => {
-          // Stop recording and send if currently recording
-          if (isRecordingRef.current) {
-            console.log('[WakeWord] Stopping recording from stop word');
-            stopRecording();
-          }
-        },
-        onError: (error) => {
-          console.error('[WakeWord] Error:', error);
-          setError(error);
+        });
+        if (!success && mounted) {
           setIsWakeWordEnabled(false);
         }
-      });
-    } else {
-      wakeWordService.stop();
-    }
+      } else {
+        await wakeWordService.stop();
+      }
+    };
+
+    setupWakeWord();
 
     return () => {
+      mounted = false;
       // Don't stop here - let the main cleanup handle it
     };
   }, [isWakeWordEnabled, isLoading, isStreaming, isProcessingAudio]);
@@ -456,6 +475,10 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
     setProposalStatuses(new Map());
     setStreamingBlocks([]);
     setUserHasScrolled(false);
+
+    // Reset token tracking for this stream
+    streamTokensRef.current = { input: 0, output: 0 };
+    setLiveStreamingTokens({ input: 0, output: 0 });
 
     // Use local variables for accumulation to avoid closure issues
     let currentRoundNumber = 0;
@@ -705,7 +728,16 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
               break;
 
             case 'done':
-              // Streaming complete for this round
+              // Streaming complete for this round - capture token usage for database
+              if (event.usage) {
+                streamTokensRef.current.input += event.usage.inputTokens;
+                streamTokensRef.current.output += event.usage.outputTokens;
+                // Also update live streaming tokens for real-time stats display
+                setLiveStreamingTokens({
+                  input: streamTokensRef.current.input,
+                  output: streamTokensRef.current.output
+                });
+              }
               break;
           }
         },
@@ -755,13 +787,15 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
           setIsSearching(false);
           setStreamingBlocks([]);
 
-          // Save to database with all contentBlocks (including thinking blocks for proper ordering)
+          // Save to database with all contentBlocks and token usage
           await window.electronAPI.db.addMessage({
             conversationId,
             role: 'assistant',
             content: fullTextContent,
             thinking: fullThinkingContent || undefined, // Keep for backwards compatibility
-            contentBlocks: blocks.length > 0 ? blocks : undefined
+            contentBlocks: blocks.length > 0 ? blocks : undefined,
+            inputTokens: streamTokensRef.current.input > 0 ? streamTokensRef.current.input : undefined,
+            outputTokens: streamTokensRef.current.output > 0 ? streamTokensRef.current.output : undefined
           });
         },
         // On error
@@ -1371,6 +1405,12 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
           dependencyNodesLoading={dependencyNodesLoading}
           onNodePositionChange={handleNodePositionChange}
           ideaId={ideaId}
+          conversationId={conversationId}
+          streamingTokens={{
+            input: liveStreamingTokens.input,
+            output: liveStreamingTokens.output,
+            isStreaming: isStreaming
+          }}
         />
       </div>
 
@@ -1396,7 +1436,7 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
           />
           {/* Voice input button */}
           <button
-            onClick={isRecording ? stopRecording : startRecording}
+            onClick={isRecording ? stopRecording : () => startRecording()}
             disabled={isLoading || isStreaming || isProcessingAudio}
             className={`p-3 rounded-xl transition-colors
                        ${isRecording

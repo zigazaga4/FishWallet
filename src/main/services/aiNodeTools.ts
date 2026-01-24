@@ -125,7 +125,15 @@ export const dependencyNodeTools: Anthropic.Tool[] = [
   },
   {
     name: 'connect_dependency_nodes',
-    description: 'Create a connection between two dependency nodes by their names.',
+    description: `Create a connection between two dependency nodes with technical integration details.
+
+When connecting services, think about what actually crosses the boundary between them:
+- What is the mechanism? (HTTP request, SDK method call, database query, message queue, webhook)
+- What travels across? (Authentication tokens, user data, events, commands, queries)
+- What protocol carries it? (HTTPS, WebSocket, gRPC, AMQP, direct function call)
+- What libraries bridge the gap? (Official SDKs, HTTP clients, database drivers)
+
+The connection should tell a developer everything they need to know to implement this integration without writing actual code.`,
     input_schema: {
       type: 'object' as const,
       properties: {
@@ -139,10 +147,30 @@ export const dependencyNodeTools: Anthropic.Tool[] = [
         },
         label: {
           type: 'string',
-          description: 'Optional label for the connection (e.g., "sends request", "depends on", "triggers", "provides data")'
+          description: 'Short label describing the relationship (e.g., "sends payment", "queries", "authenticates via")'
+        },
+        integration_method: {
+          type: 'string',
+          description: 'How they technically connect. Think: what is the mechanism that crosses the boundary? Examples: "REST API call", "SDK method invocation", "SQL query", "WebSocket message", "Webhook callback", "Message queue publish/subscribe"'
+        },
+        data_flow: {
+          type: 'string',
+          description: 'What data travels across this connection. Think: if you intercepted this connection, what would you see? Examples: "JWT tokens for user authentication", "Payment intent objects with amount and currency", "User profile documents", "Real-time price update events"'
+        },
+        protocol: {
+          type: 'string',
+          description: 'The communication protocol. Think: what wire format carries the data? Examples: "HTTPS/JSON", "WSS (WebSocket Secure)", "gRPC/Protocol Buffers", "AMQP", "PostgreSQL wire protocol"'
+        },
+        sdk_libraries: {
+          type: 'string',
+          description: 'Libraries a developer needs to implement this. Think: what npm packages or imports bridge these services? Examples: "@stripe/stripe-js", "pg (node-postgres)", "socket.io-client", "aws-sdk"'
+        },
+        technical_notes: {
+          type: 'string',
+          description: 'Implementation guidance for a developer. Explain the integration pattern, authentication flow, error handling approach, and any gotchas. Write as if briefing a developer who will implement this - be specific about what they need to do, but without actual code.'
         }
       },
-      required: ['from_node', 'to_node']
+      required: ['from_node', 'to_node', 'integration_method', 'data_flow', 'protocol', 'technical_notes']
     }
   },
   {
@@ -195,7 +223,14 @@ export async function executeDependencyNodeToolCall(
         ideaId,
         toolInput.from_node as string,
         toolInput.to_node as string,
-        toolInput.label as string | undefined
+        toolInput.label as string | undefined,
+        {
+          integrationMethod: toolInput.integration_method as string,
+          dataFlow: toolInput.data_flow as string,
+          protocol: toolInput.protocol as string,
+          sdkLibraries: toolInput.sdk_libraries as string | undefined,
+          technicalNotes: toolInput.technical_notes as string
+        }
       );
 
     case 'disconnect_dependency_nodes':
@@ -308,12 +343,22 @@ function executeDeleteNode(nodeId: string): ToolResult {
   };
 }
 
+// Connection details interface for tool input
+interface ConnectionDetailsInput {
+  integrationMethod: string;
+  dataFlow: string;
+  protocol: string;
+  sdkLibraries?: string;
+  technicalNotes: string;
+}
+
 // Connect two nodes by name
 function executeConnectNodes(
   ideaId: string,
   fromNodeName: string,
   toNodeName: string,
-  label?: string
+  label?: string,
+  details?: ConnectionDetailsInput
 ): ToolResult {
   // Look up nodes by name
   const state = dependencyNodesService.getFullState(ideaId);
@@ -338,17 +383,26 @@ function executeConnectNodes(
     ideaId,
     fromNodeId: fromNode.id,
     toNodeId: toNode.id,
-    label
+    label,
+    details: details ? {
+      integrationMethod: details.integrationMethod,
+      dataFlow: details.dataFlow,
+      protocol: details.protocol,
+      sdkLibraries: details.sdkLibraries,
+      technicalNotes: details.technicalNotes
+    } : undefined
   });
 
   return {
     success: true,
     data: {
-      message: `Connected ${fromNode.name} -> ${toNode.name}${label ? ` (${label})` : ''}`,
+      message: `Connected ${fromNode.name} -> ${toNode.name}${label ? ` (${label})` : ''} with integration details`,
       connectionId: connection.id,
       fromNode: fromNode.name,
       toNode: toNode.name,
-      label: connection.label
+      label: connection.label,
+      integrationMethod: details?.integrationMethod,
+      protocol: details?.protocol
     }
   };
 }

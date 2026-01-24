@@ -219,6 +219,13 @@ function createTables(): void {
     CREATE INDEX IF NOT EXISTS idx_api_node_connections_from ON api_node_connections(from_node_id);
     CREATE INDEX IF NOT EXISTS idx_api_node_connections_to ON api_node_connections(to_node_id);
   `);
+
+  // Migration: Add details column to api_node_connections for technical integration details
+  try {
+    sqlite.exec(`ALTER TABLE api_node_connections ADD COLUMN details TEXT`);
+  } catch {
+    // Column already exists, ignore error
+  }
 }
 
 // Get the database instance

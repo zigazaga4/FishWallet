@@ -32,13 +32,33 @@ interface DependencyNode {
 }
 
 // Dependency Node Connection type
+// Connection technical details structure
+interface ConnectionDetails {
+  integrationMethod: string;
+  dataFlow: string;
+  protocol: string;
+  sdkLibraries?: string;
+  technicalNotes: string;
+}
+
 interface DependencyNodeConnection {
   id: string;
   ideaId: string;
   fromNodeId: string;
   toNodeId: string;
   label: string | null;
+  details: string | null;  // JSON string of ConnectionDetails
   createdAt: Date;
+}
+
+// Parse connection details from JSON string
+function parseConnectionDetails(detailsStr: string | null): ConnectionDetails | null {
+  if (!detailsStr) return null;
+  try {
+    return JSON.parse(detailsStr) as ConnectionDetails;
+  } catch {
+    return null;
+  }
 }
 
 // Props for DependencyNodesView component
@@ -382,6 +402,152 @@ function NodeDetailDialog({
   );
 }
 
+// Connection detail dialog - full technical integration details
+function ConnectionDetailDialog({
+  connection,
+  fromNode,
+  toNode,
+  onClose
+}: {
+  connection: DependencyNodeConnection;
+  fromNode: DependencyNode | undefined;
+  toNode: DependencyNode | undefined;
+  onClose: () => void;
+}): ReactElement {
+  const details = parseConnectionDetails(connection.details);
+  const fromColor = fromNode?.color || '#3b82f6';
+  const toColor = toNode?.color || '#3b82f6';
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60"
+      onClick={onClose}
+    >
+      <div
+        className="bg-[#0a1628] rounded-xl shadow-2xl border border-sky-500/30 max-w-lg w-full mx-4 overflow-hidden"
+        onClick={(e) => e.stopPropagation()}
+      >
+        {/* Header */}
+        <div className="px-5 py-4 bg-gradient-to-r from-sky-900/50 to-blue-900/50 border-b border-sky-500/20">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              {/* From node */}
+              <div className="flex items-center gap-1.5">
+                <div className="w-3 h-3 rounded-full" style={{ backgroundColor: fromColor }} />
+                <span className="text-sm font-semibold text-blue-50">{fromNode?.name || 'Unknown'}</span>
+              </div>
+              {/* Arrow */}
+              <svg className="w-5 h-5 text-sky-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14 5l7 7m0 0l-7 7m7-7H3" />
+              </svg>
+              {/* To node */}
+              <div className="flex items-center gap-1.5">
+                <span className="text-sm font-semibold text-blue-50">{toNode?.name || 'Unknown'}</span>
+                <div className="w-3 h-3 rounded-full" style={{ backgroundColor: toColor }} />
+              </div>
+            </div>
+            <button
+              onClick={onClose}
+              className="p-1 text-blue-300 hover:text-blue-100 hover:bg-[#1e3a5f] rounded transition-colors"
+            >
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+              </svg>
+            </button>
+          </div>
+          {connection.label && (
+            <p className="text-sky-300 text-sm mt-2">{connection.label}</p>
+          )}
+        </div>
+
+        {/* Content */}
+        <div className="px-5 py-4 space-y-4 max-h-[60vh] overflow-y-auto">
+          {details ? (
+            <>
+              {/* Integration Method */}
+              <div>
+                <div className="flex items-center gap-2 mb-1.5">
+                  <svg className="w-4 h-4 text-sky-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
+                  </svg>
+                  <h3 className="text-sm font-medium text-sky-300">Integration Method</h3>
+                </div>
+                <p className="text-sm text-blue-100 pl-6">{details.integrationMethod}</p>
+              </div>
+
+              {/* Protocol */}
+              <div>
+                <div className="flex items-center gap-2 mb-1.5">
+                  <svg className="w-4 h-4 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8.111 16.404a5.5 5.5 0 017.778 0M12 20h.01m-7.08-7.071c3.904-3.905 10.236-3.905 14.141 0M1.394 9.393c5.857-5.857 15.355-5.857 21.213 0" />
+                  </svg>
+                  <h3 className="text-sm font-medium text-emerald-300">Protocol</h3>
+                </div>
+                <p className="text-sm text-blue-100 pl-6">{details.protocol}</p>
+              </div>
+
+              {/* Data Flow */}
+              <div>
+                <div className="flex items-center gap-2 mb-1.5">
+                  <svg className="w-4 h-4 text-amber-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16V4m0 0L3 8m4-4l4 4m6 0v12m0 0l4-4m-4 4l-4-4" />
+                  </svg>
+                  <h3 className="text-sm font-medium text-amber-300">Data Flow</h3>
+                </div>
+                <p className="text-sm text-blue-100 pl-6">{details.dataFlow}</p>
+              </div>
+
+              {/* SDK/Libraries */}
+              {details.sdkLibraries && (
+                <div>
+                  <div className="flex items-center gap-2 mb-1.5">
+                    <svg className="w-4 h-4 text-violet-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4" />
+                    </svg>
+                    <h3 className="text-sm font-medium text-violet-300">SDK / Libraries</h3>
+                  </div>
+                  <p className="text-sm text-blue-100 pl-6 font-mono">{details.sdkLibraries}</p>
+                </div>
+              )}
+
+              {/* Technical Notes */}
+              <div>
+                <div className="flex items-center gap-2 mb-1.5">
+                  <svg className="w-4 h-4 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                  </svg>
+                  <h3 className="text-sm font-medium text-blue-300">Technical Notes</h3>
+                </div>
+                <div className="bg-[#112240] rounded-lg p-3 ml-6 border border-[#1e3a5f]">
+                  <p className="text-sm text-blue-100 whitespace-pre-wrap">{details.technicalNotes}</p>
+                </div>
+              </div>
+            </>
+          ) : (
+            <div className="text-center py-6 text-blue-300/60">
+              <svg className="w-10 h-10 mx-auto mb-2 opacity-50" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+              </svg>
+              <p className="text-sm">No technical details available</p>
+              <p className="text-xs mt-1 text-blue-400/60">Ask the AI to add integration details</p>
+            </div>
+          )}
+        </div>
+
+        {/* Footer */}
+        <div className="px-5 py-3 bg-[#0f172a] border-t border-[#1e3a5f] flex justify-end">
+          <button
+            onClick={onClose}
+            className="px-4 py-1.5 text-sm text-blue-300 hover:text-blue-100 hover:bg-[#1e3a5f] rounded transition-colors"
+          >
+            Close
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // Connection tooltip component - shows connection info on hover
 function ConnectionTooltip({
   connection,
@@ -451,6 +617,9 @@ function ConnectionTooltip({
             </p>
           </div>
         )}
+
+        {/* Click hint */}
+        <p className="text-[10px] text-sky-400/70 mt-2 text-center">Click for technical details</p>
       </div>
 
       {/* Tooltip arrow */}
@@ -480,6 +649,7 @@ export function DependencyNodesView({
   // Interaction state
   const [hoveredNodeId, setHoveredNodeId] = useState<string | null>(null);
   const [detailNodeId, setDetailNodeId] = useState<string | null>(null);
+  const [detailConnectionId, setDetailConnectionId] = useState<string | null>(null);
   const [hoveredConnectionId, setHoveredConnectionId] = useState<string | null>(null);
   const [connectionTooltipPosition, setConnectionTooltipPosition] = useState<{ x: number; y: number } | null>(null);
   const [draggingNodeId, setDraggingNodeId] = useState<string | null>(null);
@@ -493,7 +663,7 @@ export function DependencyNodesView({
   const layoutInProgress = useRef<boolean>(false);
   const layoutAttemptedForNodes = useRef<Set<string>>(new Set());
 
-  // Auto-layout effect - ONLY triggers for new nodes at (0,0) or connection changes
+  // Auto-layout effect - triggers for new nodes at (0,0) or when connections change
   useEffect(() => {
     // Don't run layout while loading
     if (isLoading) return;
@@ -507,19 +677,19 @@ export function DependencyNodesView({
       n => n.positionX === 0 && n.positionY === 0 && !layoutAttemptedForNodes.current.has(n.id)
     );
 
-    // Check if connections actually changed (not first mount)
+    // Check if connections changed (track by count for simplicity)
     const isFirstMount = lastConnectionCount.current === -1;
     const connectionCountChanged = !isFirstMount && connections.length !== lastConnectionCount.current;
 
     // Update connection count tracking
     lastConnectionCount.current = connections.length;
 
-    // Only layout if there are new nodes at origin
-    // Connection changes only trigger relayout if there are already nodes needing layout
-    if (newNodesAtOrigin.length === 0 && !connectionCountChanged) return;
+    // Layout if:
+    // 1. There are new nodes at (0,0) that need positioning
+    // 2. OR connections changed (to re-arrange based on new graph structure)
+    const shouldLayout = newNodesAtOrigin.length > 0 || connectionCountChanged;
 
-    // If it's just a connection change with no nodes at origin, skip
-    if (connectionCountChanged && newNodesAtOrigin.length === 0) return;
+    if (!shouldLayout) return;
 
     // Mark all current nodes as "attempted"
     nodes.forEach(n => layoutAttemptedForNodes.current.add(n.id));
@@ -532,8 +702,8 @@ export function DependencyNodesView({
     const positionChanges: Array<{ nodeId: string; x: number; y: number }> = [];
 
     nodes.forEach(node => {
-      // Skip manually positioned nodes (unless at 0,0)
-      if (manuallyPositioned.current.has(node.id) && node.positionX !== 0 && node.positionY !== 0) {
+      // Skip manually positioned nodes (unless at 0,0 or this is a connection change relayout)
+      if (manuallyPositioned.current.has(node.id) && node.positionX !== 0 && node.positionY !== 0 && !connectionCountChanged) {
         return;
       }
 
@@ -754,12 +924,13 @@ export function DependencyNodesView({
           <div className="w-px h-4 bg-[#1e3a5f] mx-1" />
           <button
             onClick={handleRelayout}
-            className="p-1.5 text-blue-300 hover:text-blue-100 hover:bg-[#1e3a5f] rounded transition-colors"
-            title="Auto-arrange nodes"
+            className="flex items-center gap-1.5 px-2 py-1 text-blue-300 hover:text-blue-100 hover:bg-sky-500/20 rounded transition-colors border border-transparent hover:border-sky-500/30"
+            title="Auto-arrange all nodes based on connections"
           >
             <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 5a1 1 0 011-1h14a1 1 0 011 1v2a1 1 0 01-1 1H5a1 1 0 01-1-1V5zM4 13a1 1 0 011-1h6a1 1 0 011 1v6a1 1 0 01-1 1H5a1 1 0 01-1-1v-6zM16 13a1 1 0 011-1h2a1 1 0 011 1v6a1 1 0 01-1 1h-2a1 1 0 01-1-1v-6z" />
             </svg>
+            <span className="text-xs">Auto-arrange</span>
           </button>
           <span className="text-xs text-blue-400 ml-2">{Math.round(scale * 100)}%</span>
         </div>
@@ -826,7 +997,7 @@ export function DependencyNodesView({
               const isHovered = hoveredConnectionId === conn.id;
               return (
                 <g key={conn.id} className="connection-group">
-                  {/* Invisible wider path for hover detection */}
+                  {/* Invisible wider path for hover detection and click */}
                   <path
                     d={path}
                     fill="none"
@@ -836,6 +1007,7 @@ export function DependencyNodesView({
                     onMouseEnter={(e) => handleConnectionMouseEnter(conn.id, e as unknown as MouseEvent)}
                     onMouseMove={(e) => handleConnectionMouseMove(e as unknown as MouseEvent)}
                     onMouseLeave={handleConnectionMouseLeave}
+                    onClick={() => setDetailConnectionId(conn.id)}
                   />
                   {/* Base connection line */}
                   <path
@@ -987,9 +1159,26 @@ export function DependencyNodesView({
       </div>
 
       {/* Detail dialog */}
+      {/* Node detail dialog */}
       {detailNode && (
         <NodeDetailDialog node={detailNode} onClose={() => setDetailNodeId(null)} />
       )}
+
+      {/* Connection detail dialog */}
+      {detailConnectionId && (() => {
+        const detailConnection = connections.find(c => c.id === detailConnectionId);
+        if (!detailConnection) return null;
+        const fromNode = nodes.find(n => n.id === detailConnection.fromNodeId);
+        const toNode = nodes.find(n => n.id === detailConnection.toNodeId);
+        return (
+          <ConnectionDetailDialog
+            connection={detailConnection}
+            fromNode={fromNode}
+            toNode={toNode}
+            onClose={() => setDetailConnectionId(null)}
+          />
+        );
+      })()}
     </div>
   );
 }

@@ -41,7 +41,8 @@ export class SpeechToTextService {
 
     this.apiKey = apiKey;
     this.client = new OpenAI({
-      apiKey: this.apiKey
+      apiKey: this.apiKey,
+      timeout: Infinity
     });
   }
 
