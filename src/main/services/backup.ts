@@ -2,8 +2,7 @@
 
 import { app } from 'electron';
 import { join } from 'path';
-import { existsSync, mkdirSync, readdirSync, statSync, copyFileSync, rmSync } from 'fs';
-import { copySync } from 'fs-extra';
+import { existsSync, mkdirSync, readdirSync, statSync, copyFileSync, rmSync, cpSync } from 'fs';
 import { logger } from './logger';
 
 // Directories to skip when copying project folders
@@ -28,9 +27,9 @@ export interface BackupResult {
   timestamp: string;
 }
 
-// Filter function for fs-extra copySync — skip heavy/generated directories
+// Filter function for cpSync — skip heavy/generated directories
 function copyFilter(src: string): boolean {
-  const name = src.split('/').pop() || '';
+  const name = src.replace(/\\/g, '/').split('/').pop() || '';
   if (SKIP_DIRS.has(name)) return false;
   if (SKIP_FILES.has(name)) return false;
   return true;
@@ -81,7 +80,7 @@ class BackupService {
           const destPath = join(backupDir, entry.name);
 
           logger.info('[Backup] Copying project folder', { name: entry.name });
-          copySync(srcPath, destPath, { filter: copyFilter });
+          cpSync(srcPath, destPath, { recursive: true, filter: copyFilter });
         }
       }
 
