@@ -1,8 +1,13 @@
 // Dev Server Service - Manages Vite dev servers for idea projects
 // Only one dev server active at a time. Starting a new one stops the old one.
 
-import { spawn, ChildProcess } from 'child_process';
+import { spawn, execSync, ChildProcess } from 'child_process';
+import { createServer } from 'net';
+import { existsSync } from 'fs';
+import { join } from 'path';
 import { logger } from './logger';
+
+const isWindows = process.platform === 'win32';
 
 // Active dev server state
 interface ActiveDevServer {
@@ -17,9 +22,18 @@ let activeServer: ActiveDevServer | null = null;
 // Mutex to prevent concurrent startDevServer calls from racing
 let startupPromise: Promise<{ port: number; success: boolean; error?: string }> | null = null;
 
-// Port range to try for dev servers
-const PORT_START = 5174;
-const PORT_END = 5178;
+// Find a free port by letting the OS assign one
+function findFreePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const srv = createServer();
+    srv.listen(0, '127.0.0.1', () => {
+      const addr = srv.address();
+      const port = (addr && typeof addr === 'object') ? addr.port : 0;
+      srv.close(() => resolve(port));
+    });
+    srv.on('error', reject);
+  });
+}
 
 // Start a Vite dev server for a project
 export async function startDevServer(
@@ -44,20 +58,27 @@ export async function startDevServer(
       // Stop any existing server first
       await stopDevServer();
 
-      // Try ports sequentially
-      for (let port = PORT_START; port <= PORT_END; port++) {
+      // Ensure node_modules exist before starting Vite
+      if (!existsSync(join(projectPath, 'node_modules'))) {
+        logger.info('[DevServer] node_modules missing, running npm install', { projectPath });
         try {
-          const result = await tryStartOnPort(ideaId, projectPath, port);
-          if (result.success) {
-            return result;
-          }
-        } catch {
-          // Port in use or failed, try next
-          continue;
+          execSync('npm install', { cwd: projectPath, timeout: 120000, stdio: 'pipe' });
+          logger.info('[DevServer] npm install completed', { projectPath });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          logger.error('[DevServer] npm install failed', { error: msg });
+          return { port: 0, success: false, error: `npm install failed: ${msg.slice(0, 200)}` };
         }
       }
 
-      return { port: 0, success: false, error: 'All ports in use (5174-5178)' };
+      // Let the OS pick a free port
+      const port = await findFreePort();
+      logger.info('[DevServer] OS assigned free port', { port });
+
+      return await tryStartOnPort(ideaId, projectPath, port);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return { port: 0, success: false, error: msg };
     } finally {
       startupPromise = null;
     }
@@ -75,32 +96,39 @@ function tryStartOnPort(
   return new Promise((resolve) => {
     logger.info('[DevServer] Attempting to start on port', { port, projectPath });
 
-    const child = spawn('npx', ['vite', '--port', String(port), '--strictPort'], {
+    const child = spawn('npx', ['vite', '--port', String(port), '--strictPort', '--host'], {
       cwd: projectPath,
       stdio: ['pipe', 'pipe', 'pipe'],
       shell: true,
-      env: { ...process.env }
+      detached: false,
+      env: { ...process.env, NO_COLOR: '1', FORCE_COLOR: '0' }
     });
 
     let resolved = false;
     let stderrOutput = '';
+    let allOutput = ''; // Accumulate all output to handle chunked writes
 
     // Set a timeout in case the server never becomes ready
     const timeout = setTimeout(() => {
       if (!resolved) {
         resolved = true;
-        child.kill();
+        killProcessTree(child);
         resolve({ port, success: false, error: 'Dev server startup timed out' });
       }
     }, 30000); // 30 second timeout
 
-    // Watch stdout for the "ready" signal (localhost URL)
-    child.stdout?.on('data', (data: Buffer) => {
-      const output = data.toString();
-      logger.info('[DevServer] stdout:', output.trim());
+    // Strip ANSI escape codes — Vite outputs colored text that breaks string matching
+    function stripAnsi(s: string): string {
+      return s.replace(/\x1b\[[0-9;]*m/g, '');
+    }
 
-      // Vite outputs something like: Local: http://localhost:5174/
-      if (output.includes(`localhost:${port}`) || output.includes(`127.0.0.1:${port}`)) {
+    // Check if Vite is ready by looking for the port in accumulated output
+    function checkReady(source: string, chunk: string): void {
+      allOutput += stripAnsi(chunk);
+      logger.info(`[DevServer] ${source}:`, chunk.trim());
+
+      // Vite outputs: "Local: http://localhost:<port>/" on stdout or stderr
+      if (allOutput.includes(`localhost:${port}`) || allOutput.includes(`127.0.0.1:${port}`)) {
         if (!resolved) {
           resolved = true;
           clearTimeout(timeout);
@@ -116,11 +144,14 @@ function tryStartOnPort(
           resolve({ port, success: true });
         }
       }
-    });
+    }
+
+    // Watch both stdout and stderr — on Windows, Vite may print to either
+    child.stdout?.on('data', (data: Buffer) => checkReady('stdout', data.toString()));
 
     child.stderr?.on('data', (data: Buffer) => {
       stderrOutput += data.toString();
-      logger.warn('[DevServer] stderr:', data.toString().trim());
+      checkReady('stderr', data.toString());
     });
 
     child.on('error', (err) => {
@@ -150,6 +181,21 @@ function tryStartOnPort(
   });
 }
 
+// Kill a process tree — on Windows, child.kill() only kills the shell wrapper,
+// not the actual Vite process. Use taskkill /T /F to kill the entire tree.
+function killProcessTree(child: ChildProcess): void {
+  if (isWindows && child.pid) {
+    try {
+      execSync(`taskkill /pid ${child.pid} /T /F`, { stdio: 'ignore' });
+      return;
+    } catch {
+      // Process already gone
+    }
+  }
+  // Unix: SIGTERM is enough
+  try { child.kill('SIGTERM'); } catch { /* already gone */ }
+}
+
 // Stop the active dev server
 export async function stopDevServer(): Promise<void> {
   if (!activeServer) return;
@@ -159,17 +205,11 @@ export async function stopDevServer(): Promise<void> {
 
   activeServer = null;
 
-  // Try SIGTERM first
-  serverProcess.kill('SIGTERM');
+  killProcessTree(serverProcess);
 
-  // Wait up to 3 seconds, then SIGKILL
+  // Wait up to 3 seconds for exit confirmation
   await new Promise<void>((resolve) => {
     const killTimeout = setTimeout(() => {
-      try {
-        serverProcess.kill('SIGKILL');
-      } catch {
-        // Process already gone
-      }
       resolve();
     }, 3000);
 
@@ -192,11 +232,7 @@ export function getActiveDevServer(): { port: number; ideaId: string } | null {
 export function shutdownAllDevServers(): void {
   if (activeServer) {
     logger.info('[DevServer] Shutting down all servers');
-    try {
-      activeServer.process.kill('SIGKILL');
-    } catch {
-      // Process already gone
-    }
+    killProcessTree(activeServer.process);
     activeServer = null;
   }
 }
