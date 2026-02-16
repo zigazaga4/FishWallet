@@ -18,6 +18,18 @@ import { initializeDatabase, closeDatabase } from './db';
 import { speechToTextService } from './services/speechToText';
 import { logger } from './services/logger';
 
+// Catch uncaught exceptions from the Agent SDK's internal stream race condition
+// (ERR_STREAM_WRITE_AFTER_END when subprocess exits before all writes flush)
+process.on('uncaughtException', (error) => {
+  if (error?.message?.includes('write after end')) {
+    logger.warn('[Main] Suppressed stream write-after-end from Agent SDK:', error.message);
+    return; // Non-fatal — swallow it
+  }
+  // Re-throw anything else so Electron's default dialog still shows
+  logger.error('[Main] Uncaught exception:', error.message);
+  throw error;
+});
+
 // Load environment variables from .env file
 // In production, .env might be in extraResources or app path
 const envPaths = [

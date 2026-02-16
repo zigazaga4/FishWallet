@@ -60,15 +60,16 @@ class WakeWordService {
 
       // Set wasmPaths as an OBJECT (not string) so the bundle's inlined
       // Emscripten glue code is used instead of dynamically importing .mjs files
+      // Use relative path so it works in both dev (http://localhost) and production (file://)
       ort.env.wasm.wasmPaths = {
-        wasm: '/openwakeword/ort/ort-wasm-simd-threaded.wasm'
+        wasm: './openwakeword/ort/ort-wasm-simd-threaded.wasm'
       } as any;
 
       // Create engine — do NOT pass ortWasmPath (it sets wasmPaths as a string
       // which would bypass the inlined glue code and break in Vite)
       const engine = new WakeWordEngine({
         keywords: ['alexa'],
-        baseAssetUrl: '/openwakeword/models',
+        baseAssetUrl: './openwakeword/models',
         detectionThreshold: 0.3,
         cooldownMs: 2000,
         debug: true,
