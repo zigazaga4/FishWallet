@@ -1,123 +1,15 @@
-import { useState, useRef, useEffect, useCallback, type ReactElement } from 'react';
-import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
-import { ThinkingBlock } from './ThinkingBlock';
-import { WebSearchBlock } from './WebSearchBlock';
-import { ProposedNoteBlock } from './ProposedNoteBlock';
+import { useState, useRef, useEffect, useCallback, useMemo, type ReactElement } from 'react';
+import { useVirtualizer } from '@tanstack/react-virtual';
 import { Panel, type PanelTab } from './Panel';
+import { ConversationTree } from './ConversationTree';
+import { ChatInput } from './ChatInput';
+import { MessageItem } from './MessageItem';
+import { StreamingArea } from './StreamingArea';
 import { wakeWordService } from '../services/wakeWordService';
-
-// Content block for ordered display - includes thinking blocks for proper ordering
-interface ContentBlock {
-  id: string;
-  type: 'text' | 'tool_use' | 'thinking';
-  content?: string;
-  toolName?: string;
-  toolInput?: Record<string, unknown>;
-  toolResult?: { success: boolean; data?: unknown; error?: string };
-  // Thinking-specific fields
-  roundNumber?: number;
-  isThinkingActive?: boolean;
-  // Note proposal fields (for propose_note tool)
-  proposal?: ProposedNote;
-}
-
-// Message type for display
-interface ChatMessage {
-  id: string;
-  role: 'user' | 'assistant' | 'system';
-  content: string;
-  createdAt: Date;
-  thinking?: string;
-  contentBlocks?: ContentBlock[];
-}
-
-// Web search result item
-interface SearchResultItem {
-  rank: number;
-  title: string;
-  url: string;
-  snippet: string;
-}
-
-// Proposed note from AI
-interface ProposedNote {
-  id: string;
-  title: string;
-  content: string;
-  category: 'research' | 'decision' | 'recommendation' | 'insight' | 'warning' | 'todo';
-  ideaId: string;
-}
-
-// Proposal status for tracking accept/reject
-interface ProposalStatus {
-  isProcessing: boolean;
-  isAccepted: boolean;
-  isRejected: boolean;
-}
-
-// Stream event type from synthesis/app builder API
-// tool_start: Emitted immediately when tool block starts streaming (name and ID known)
-// tool_input_delta: Emitted as tool input JSON streams in (for live content preview)
-// tool_use: Emitted when tool block is complete (full input parsed)
-// web_search: Emitted when AI starts a web search
-// web_search_result: Emitted with search results
-// note_proposal: Emitted when AI proposes adding a note (includes toolId for matching)
-interface StreamEvent {
-  type: 'thinking_start' | 'thinking' | 'thinking_done' | 'text' | 'tool_start' | 'tool_input_delta' | 'tool_use' | 'tool_result' | 'web_search' | 'web_search_result' | 'note_proposal' | 'done';
-  content?: string;
-  toolCall?: { id: string; name: string; input: Record<string, unknown> };
-  toolId?: string;  // Used by tool_start, tool_result, note_proposal to match tool blocks
-  toolName?: string;
-  partialInput?: string;
-  result?: { success: boolean; data?: unknown; error?: string };
-  stopReason?: string;
-  // Web search specific fields
-  searchQuery?: string;
-  searchResults?: SearchResultItem[];
-  // Note proposal fields (note_proposal event)
-  proposal?: ProposedNote;
-  // Token usage (from done event)
-  usage?: { inputTokens: number; outputTokens: number };
-}
-
-// Project file interface
-interface ProjectFile {
-  id: string;
-  ideaId: string;
-  filePath: string;
-  content: string;
-  fileType: 'tsx' | 'ts' | 'css';
-  isEntryFile: boolean;
-  createdAt: Date;
-  updatedAt: Date;
-}
-
-// Dependency Node type
-interface DependencyNode {
-  id: string;
-  ideaId: string;
-  name: string;
-  provider: string;
-  description: string;
-  pricing: string | null;
-  positionX: number;
-  positionY: number;
-  color: string | null;
-  createdAt: Date;
-  updatedAt: Date;
-}
-
-// Dependency Node Connection type
-interface DependencyNodeConnection {
-  id: string;
-  ideaId: string;
-  fromNodeId: string;
-  toNodeId: string;
-  label: string | null;
-  details: string | null;
-  createdAt: Date;
-}
+import type {
+  ContentBlock, ChatMessage, SearchResultItem, ProposedNote, ProposalStatus,
+  DependencyNode, DependencyNodeConnection, StreamEvent
+} from './types/chat';
 
 // Extract content from partial JSON string like {"content":"# My Idea\n...
 function extractContentFromPartialJson(partialJson: string): string {
@@ -152,6 +44,25 @@ function extractContentFromPartialJson(partialJson: string): string {
   return content;
 }
 
+// Throttle utility for scroll handler
+function throttle<T extends (...args: unknown[]) => void>(fn: T, ms: number): T {
+  let lastCall = 0;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  return ((...args: unknown[]) => {
+    const now = Date.now();
+    if (now - lastCall >= ms) {
+      lastCall = now;
+      fn(...args);
+    } else if (!timer) {
+      timer = setTimeout(() => {
+        lastCall = Date.now();
+        timer = null;
+        fn(...args);
+      }, ms - (now - lastCall));
+    }
+  }) as T;
+}
+
 // Props for the IdeaChat component
 interface IdeaChatProps {
   ideaId: string;
@@ -164,18 +75,19 @@ interface IdeaChatProps {
 // Guided by the Holy Spirit
 export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: IdeaChatProps): ReactElement {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [inputValue, setInputValue] = useState<string>('');
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [isStreaming, setIsStreaming] = useState<boolean>(false);
   const [liveStreamingTokens, setLiveStreamingTokens] = useState<{ input: number; output: number }>({ input: 0, output: 0 });
   const [isThinking, setIsThinking] = useState<boolean>(false);
+  const [isCompacting, setIsCompacting] = useState<boolean>(false);
+  const [previewRefreshKey, setPreviewRefreshKey] = useState<number>(0);
   const [currentThinkingRound, setCurrentThinkingRound] = useState<number>(0);
   const [isSearching, setIsSearching] = useState<boolean>(false);
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [searchResults, setSearchResults] = useState<SearchResultItem[]>([]);
-  // Note: proposals are now stored directly in ContentBlock.proposal for inline rendering
-  const [proposalStatuses, setProposalStatuses] = useState<Map<string, ProposalStatus>>(new Map());
+  const [proposalStatuses, setProposalStatuses] = useState<Record<string, ProposalStatus>>({});
   const [streamingBlocks, setStreamingBlocks] = useState<ContentBlock[]>([]);
+  const activeBlocksRef = useRef<ContentBlock[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [userHasScrolled, setUserHasScrolled] = useState<boolean>(false);
 
@@ -185,21 +97,47 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
   const [panelLoading, setPanelLoading] = useState<boolean>(false);
   const [activePanelTab, setActivePanelTab] = useState<PanelTab>('main-idea');
 
-  // App builder state
-  const [appFiles, setAppFiles] = useState<ProjectFile[]>([]);
-  const [appEntryFile, setAppEntryFile] = useState<ProjectFile | null>(null);
-  const [appLoading, setAppLoading] = useState<boolean>(false);
-
   // Dependency nodes state
   const [dependencyNodes, setDependencyNodes] = useState<DependencyNode[]>([]);
   const [dependencyConnections, setDependencyConnections] = useState<DependencyNodeConnection[]>([]);
   const [dependencyNodesLoading, setDependencyNodesLoading] = useState<boolean>(false);
 
+  // Branch / tree state
+  const [showTree, setShowTree] = useState<boolean>(false);
+  const [branches, setBranches] = useState<Array<{
+    id: string; ideaId: string; parentBranchId: string | null;
+    conversationId: string | null; label: string; depth: number;
+    isActive: boolean; createdAt: Date; updatedAt: Date;
+  }>>([]);
+  const [activeBranchId, setActiveBranchId] = useState<string | null>(null);
+  const [isCreatingBranch, setIsCreatingBranch] = useState<boolean>(false);
+  const [effectiveConversationId, setEffectiveConversationId] = useState<string>(conversationId);
+
+  // Snapshot viewing state
+  const [viewingSnapshotId, setViewingSnapshotId] = useState<string | null>(null);
+  const [viewingSnapshotData, setViewingSnapshotData] = useState<{
+    versionNumber: number;
+    synthesisContent: string | null;
+    nodes: DependencyNode[];
+    connections: DependencyNodeConnection[];
+  } | null>(null);
+
   // Voice input state
   const [isRecording, setIsRecording] = useState<boolean>(false);
   const [isProcessingAudio, setIsProcessingAudio] = useState<boolean>(false);
-  const [isWakeWordEnabled, setIsWakeWordEnabled] = useState<boolean>(false);
+  const [isWakeWordEnabled, setIsWakeWordEnabled] = useState<boolean>(true);
   const [isWakeWordAvailable] = useState<boolean>(wakeWordService.isAvailable());
+  const [pendingTranscription, setPendingTranscription] = useState<string | null>(null);
+
+  // Voice agent state (Haiku-powered app navigation)
+  const [isVoiceAgentRecording, setIsVoiceAgentRecording] = useState<boolean>(false);
+  const [isVoiceAgentRunning, setIsVoiceAgentRunning] = useState<boolean>(false);
+  const [voiceAgentResponse, setVoiceAgentResponse] = useState<string | null>(null);
+  const voiceAgentRecorderRef = useRef<MediaRecorder | null>(null);
+  const voiceAgentChunksRef = useRef<Blob[]>([]);
+  const voiceAgentStreamRef = useRef<MediaStream | null>(null);
+  const voiceAgentCleanupRef = useRef<(() => void) | null>(null);
+  const voiceAgentResponseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Ref to accumulate tokens during streaming (for saving to database)
   const streamTokensRef = useRef<{ input: number; output: number }>({ input: 0, output: 0 });
@@ -209,22 +147,64 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
   const isMountedRef = useRef<boolean>(true);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
+  const audioStreamRef = useRef<MediaStream | null>(null);
+
+  // Debounce timer for dependency nodes reload
+  const dependencyNodesReloadTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingDependencyNodesReload = useRef<boolean>(false);
+
+  // Ref to capture snapshot-created events during streaming
+  const pendingSnapshotRef = useRef<{ ideaId: string; versionNumber: number; snapshotId: string } | null>(null);
+
+  // Refs for throttled scroll handler (avoids stale closures)
+  const isStreamingRef = useRef(isStreaming);
+  useEffect(() => { isStreamingRef.current = isStreaming; }, [isStreaming]);
+  const isLoadingRef = useRef(isLoading);
+  useEffect(() => { isLoadingRef.current = isLoading; }, [isLoading]);
 
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
-  const inputRef = useRef<HTMLTextAreaElement>(null);
+
+  // Cleanup function to stop all media tracks
+  const cleanupAudioStream = (): void => {
+    if (audioStreamRef.current) {
+      audioStreamRef.current.getTracks().forEach(track => {
+        track.stop();
+        console.log('[IdeaChat] Stopped audio track:', track.kind, track.label);
+      });
+      audioStreamRef.current = null;
+    }
+    mediaRecorderRef.current = null;
+  };
 
   // Cleanup on unmount
   useEffect(() => {
     isMountedRef.current = true;
     return () => {
       isMountedRef.current = false;
-      // Clean up any active stream
+      console.log('[IdeaChat] Unmounting, cleaning up...');
       if (activeStreamCleanupRef.current) {
         activeStreamCleanupRef.current();
         activeStreamCleanupRef.current = null;
       }
-      // Stop wake word detection
+      if (dependencyNodesReloadTimerRef.current) {
+        clearTimeout(dependencyNodesReloadTimerRef.current);
+        dependencyNodesReloadTimerRef.current = null;
+      }
+      cleanupAudioStream();
+      // Cleanup voice agent resources
+      if (voiceAgentStreamRef.current) {
+        voiceAgentStreamRef.current.getTracks().forEach(t => t.stop());
+        voiceAgentStreamRef.current = null;
+      }
+      voiceAgentRecorderRef.current = null;
+      if (voiceAgentCleanupRef.current) {
+        voiceAgentCleanupRef.current();
+        voiceAgentCleanupRef.current = null;
+      }
+      if (voiceAgentResponseTimerRef.current) {
+        clearTimeout(voiceAgentResponseTimerRef.current);
+      }
       wakeWordService.stop().catch(() => {/* ignore cleanup errors */});
     };
   }, []);
@@ -235,7 +215,13 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
     isRecordingRef.current = isRecording;
   }, [isRecording]);
 
-  // Wake word detection - "JARVIS" to activate voice input
+  // Voice agent refs for wake word callbacks
+  const isVoiceAgentRecordingRef = useRef(isVoiceAgentRecording);
+  useEffect(() => { isVoiceAgentRecordingRef.current = isVoiceAgentRecording; }, [isVoiceAgentRecording]);
+  const isVoiceAgentRunningRef = useRef(isVoiceAgentRunning);
+  useEffect(() => { isVoiceAgentRunningRef.current = isVoiceAgentRunning; }, [isVoiceAgentRunning]);
+
+  // Wake word detection - "ALEXA" to start/stop invisible voice agent recording
   useEffect(() => {
     let mounted = true;
 
@@ -243,17 +229,17 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
       if (isWakeWordEnabled) {
         const success = await wakeWordService.start({
           onWakeWord: () => {
-            // Start recording if not already recording and not busy
-            if (!isRecordingRef.current && !isLoading && !isStreaming && !isProcessingAudio) {
-              console.log('[WakeWord] Starting recording from wake word');
-              startRecording(true); // Auto-send when stopped
+            // First "Alexa" → start invisible recording for voice agent
+            if (!isVoiceAgentRecordingRef.current && !isVoiceAgentRunningRef.current) {
+              console.log('[WakeWord] Starting invisible voice agent recording');
+              startVoiceAgentRecording();
             }
           },
           onStopWord: () => {
-            // Stop recording and send if currently recording
-            if (isRecordingRef.current) {
-              console.log('[WakeWord] Stopping recording from stop word');
-              stopRecording();
+            // Second "Alexa" → stop recording, transcribe, send to voice agent
+            if (isVoiceAgentRecordingRef.current) {
+              console.log('[WakeWord] Stopping voice agent recording → transcribe → navigate');
+              stopVoiceAgentRecording();
             }
           },
           onError: (error) => {
@@ -276,16 +262,37 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
 
     return () => {
       mounted = false;
-      // Don't stop here - let the main cleanup handle it
     };
-  }, [isWakeWordEnabled, isLoading, isStreaming, isProcessingAudio]);
+  }, [isWakeWordEnabled]);
 
-  // Load existing messages on mount
+  // Listen for snapshot-created events (version badges)
   useEffect(() => {
-    loadMessages();
-    loadAppFiles();
-    loadDependencyNodes();
+    const cleanup = window.electronAPI.snapshots.onCreated((data) => {
+      if (data.ideaId === ideaId) {
+        pendingSnapshotRef.current = data;
+      }
+    });
+    return cleanup;
+  }, [ideaId]);
+
+  // Sync effectiveConversationId when prop changes
+  useEffect(() => {
+    setEffectiveConversationId(conversationId);
   }, [conversationId]);
+
+  // Load existing messages on mount or when effective conversation changes
+  useEffect(() => {
+    initialScrollDoneRef.current = false;
+    loadMessages();
+    loadDependencyNodes();
+  }, [effectiveConversationId]);
+
+  // Start the dev server eagerly when entering the idea conversation
+  useEffect(() => {
+    window.electronAPI.devServer.start(ideaId).catch(() => {
+      // Dev server start failure is non-fatal — LivePreview will retry
+    });
+  }, [ideaId]);
 
   // Load dependency nodes for the idea
   const loadDependencyNodes = async (): Promise<void> => {
@@ -303,27 +310,37 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
     }
   };
 
+  // Debounced version of loadDependencyNodes
+  const loadDependencyNodesDebounced = useCallback((): void => {
+    pendingDependencyNodesReload.current = true;
+
+    if (dependencyNodesReloadTimerRef.current) {
+      clearTimeout(dependencyNodesReloadTimerRef.current);
+    }
+
+    dependencyNodesReloadTimerRef.current = setTimeout(() => {
+      if (isMountedRef.current && pendingDependencyNodesReload.current) {
+        pendingDependencyNodesReload.current = false;
+        loadDependencyNodes();
+      }
+    }, 300);
+  }, [ideaId]);
+
   // Handle node position change (drag)
-  const handleNodePositionChange = async (nodeId: string, x: number, y: number): Promise<void> => {
-    // Optimistic update
+  const handleNodePositionChange = useCallback(async (nodeId: string, x: number, y: number): Promise<void> => {
     setDependencyNodes(prev => prev.map(n =>
       n.id === nodeId ? { ...n, positionX: x, positionY: y } : n
     ));
-
-    // Persist to database
     await window.electronAPI.dependencyNodes.updatePosition(nodeId, x, y);
-  };
+  }, []);
 
-  // Handle accepting a note proposal - creates the actual note
-  const handleAcceptProposal = async (proposal: ProposedNote): Promise<void> => {
-    // Set processing state
-    setProposalStatuses(prev => {
-      const newMap = new Map(prev);
-      newMap.set(proposal.id, { isProcessing: true, isAccepted: false, isRejected: false });
-      return newMap;
-    });
+  // Handle accepting a note proposal
+  const handleAcceptProposal = useCallback(async (proposal: ProposedNote): Promise<void> => {
+    setProposalStatuses(prev => ({
+      ...prev,
+      [proposal.id]: { isProcessing: true, isAccepted: false, isRejected: false }
+    }));
 
-    // Call API to create the note
     await window.electronAPI.ideas.acceptNoteProposal({
       ideaId: proposal.ideaId,
       title: proposal.title,
@@ -331,61 +348,163 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
       category: proposal.category
     });
 
-    // Update status to accepted
-    setProposalStatuses(prev => {
-      const newMap = new Map(prev);
-      newMap.set(proposal.id, { isProcessing: false, isAccepted: true, isRejected: false });
-      return newMap;
-    });
-  };
+    setProposalStatuses(prev => ({
+      ...prev,
+      [proposal.id]: { isProcessing: false, isAccepted: true, isRejected: false }
+    }));
+  }, []);
 
   // Handle rejecting a note proposal
-  const handleRejectProposal = (proposalId: string): void => {
-    setProposalStatuses(prev => {
-      const newMap = new Map(prev);
-      newMap.set(proposalId, { isProcessing: false, isAccepted: false, isRejected: true });
-      return newMap;
+  const handleRejectProposal = useCallback((proposalId: string): void => {
+    setProposalStatuses(prev => ({
+      ...prev,
+      [proposalId]: { isProcessing: false, isAccepted: false, isRejected: true }
+    }));
+  }, []);
+
+  // View a historical version snapshot in the panel
+  const handleViewSnapshot = useCallback(async (snapshotId: string): Promise<void> => {
+    const snapshot = await window.electronAPI.snapshots.get(snapshotId);
+    if (!snapshot || !isMountedRef.current) return;
+
+    const nodes: DependencyNode[] = JSON.parse(snapshot.nodesSnapshot);
+    const connections: DependencyNodeConnection[] = JSON.parse(snapshot.connectionsSnapshot);
+
+    setViewingSnapshotId(snapshotId);
+    setViewingSnapshotData({
+      versionNumber: snapshot.versionNumber,
+      synthesisContent: snapshot.synthesisContent,
+      nodes,
+      connections
     });
+    setPanelOpen(true);
+  }, []);
+
+  // Restore a historical version as the live version
+  const handleRestoreSnapshot = useCallback(async (snapshotId: string): Promise<void> => {
+    await window.electronAPI.snapshots.restore(snapshotId);
+    if (!isMountedRef.current) return;
+
+    setViewingSnapshotId(null);
+    setViewingSnapshotData(null);
+
+    const fullData = await window.electronAPI.ideas.getFull(ideaId);
+    if (fullData?.idea.synthesisContent) {
+      setPanelContent(fullData.idea.synthesisContent);
+    } else {
+      setPanelContent('');
+    }
+    await loadDependencyNodes();
+  }, [ideaId]);
+
+  // Return to live data from snapshot viewing
+  const handleBackToLive = useCallback((): void => {
+    setViewingSnapshotId(null);
+    setViewingSnapshotData(null);
+  }, []);
+
+  // --- Branch / Tree handlers ---
+
+  const handleOpenTree = useCallback(async (): Promise<void> => {
+    await window.electronAPI.branches.ensureRoot(ideaId);
+    const allBranches = await window.electronAPI.branches.getAll(ideaId);
+    if (!isMountedRef.current) return;
+    setBranches(allBranches);
+    const active = allBranches.find(b => b.isActive);
+    setActiveBranchId(active?.id ?? null);
+    setShowTree(true);
+  }, [ideaId]);
+
+  const reloadBranches = async (): Promise<void> => {
+    const allBranches = await window.electronAPI.branches.getAll(ideaId);
+    if (!isMountedRef.current) return;
+    setBranches(allBranches);
+    const active = allBranches.find(b => b.isActive);
+    setActiveBranchId(active?.id ?? null);
   };
 
-  // Load app files for the idea
-  const loadAppFiles = async (): Promise<void> => {
-    try {
-      setAppLoading(true);
-      const files = await window.electronAPI.files.list(ideaId);
-      if (!isMountedRef.current) return;
+  const reloadLiveData = async (): Promise<void> => {
+    const fullData = await window.electronAPI.ideas.getFull(ideaId);
+    if (!isMountedRef.current || !fullData) return;
 
-      setAppFiles(files);
-      const entryFile = files.find(f => f.isEntryFile) ?? null;
-      setAppEntryFile(entryFile);
-    } finally {
-      if (isMountedRef.current) {
-        setAppLoading(false);
-      }
+    if (fullData.idea.conversationId) {
+      setEffectiveConversationId(fullData.idea.conversationId);
     }
+
+    setPanelContent(fullData.idea.synthesisContent || '');
+
+    const allMessages: ChatMessage[] = [];
+    if (fullData.conversation?.systemPrompt) {
+      allMessages.push({
+        id: 'system-prompt',
+        role: 'system',
+        content: fullData.conversation.systemPrompt,
+        createdAt: fullData.conversation.createdAt
+      });
+    }
+    for (const msg of fullData.messages) {
+      const chatMsg: ChatMessage = {
+        id: msg.id,
+        role: msg.role,
+        content: msg.content,
+        createdAt: msg.createdAt
+      };
+      if (msg.thinking) chatMsg.thinking = msg.thinking;
+      if (msg.contentBlocks) {
+        try { chatMsg.contentBlocks = JSON.parse(msg.contentBlocks); } catch { /* ignore */ }
+      }
+      allMessages.push(chatMsg);
+    }
+    setMessages(allMessages);
+
+    await loadDependencyNodes();
+  };
+
+  const handleSwitchBranch = async (branchId: string): Promise<void> => {
+    await window.electronAPI.branches.switchTo(branchId);
+    if (!isMountedRef.current) return;
+    await reloadLiveData();
+    await reloadBranches();
+  };
+
+  const handleCreateChild = async (parentBranchId: string, label: string): Promise<void> => {
+    setIsCreatingBranch(true);
+    try {
+      await window.electronAPI.branches.createChild(parentBranchId, label);
+      if (!isMountedRef.current) return;
+      await reloadLiveData();
+      await reloadBranches();
+    } finally {
+      if (isMountedRef.current) setIsCreatingBranch(false);
+    }
+  };
+
+  const handleDeleteBranch = async (branchId: string): Promise<void> => {
+    await window.electronAPI.branches.delete(branchId);
+    if (!isMountedRef.current) return;
+    await reloadLiveData();
+    await reloadBranches();
   };
 
   // Track if we've already started synthesis for new conversation
   const hasStartedSynthesisRef = useRef<boolean>(false);
-  // Track if messages have been loaded for new conversation auto-start
   const [messagesLoaded, setMessagesLoaded] = useState<boolean>(false);
+
+  // Track whether initial scroll to bottom has been done
+  const initialScrollDoneRef = useRef<boolean>(false);
 
   // Load messages from database
   const loadMessages = async (): Promise<void> => {
-    // Load full idea data including synthesis content
     const fullData = await window.electronAPI.ideas.getFull(ideaId);
     if (!isMountedRef.current) return;
 
     if (fullData && fullData.conversation) {
-      // Load synthesis content into panel if it exists
       if (fullData.idea.synthesisContent) {
         setPanelContent(fullData.idea.synthesisContent);
       }
 
-      // Build messages array including system prompt from conversation
       const allMessages: ChatMessage[] = [];
 
-      // Add system prompt as system message if it exists
       if (fullData.conversation.systemPrompt) {
         allMessages.push({
           id: 'system-prompt',
@@ -395,7 +514,6 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
         });
       }
 
-      // Add existing messages from database, parsing thinking and contentBlocks
       for (const msg of fullData.messages) {
         const chatMsg: ChatMessage = {
           id: msg.id,
@@ -404,12 +522,10 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
           createdAt: msg.createdAt
         };
 
-        // Parse thinking if present
         if (msg.thinking) {
           chatMsg.thinking = msg.thinking;
         }
 
-        // Parse contentBlocks if present (stored as JSON string)
         if (msg.contentBlocks) {
           try {
             chatMsg.contentBlocks = JSON.parse(msg.contentBlocks);
@@ -426,39 +542,76 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
     }
   };
 
-  // Auto-scroll to bottom only when user hasn't manually scrolled
+  // Filtered messages for rendering (exclude system messages except compaction markers)
+  const filteredMessages = useMemo(() =>
+    messages.filter(m => m.role !== 'system' || m.content.startsWith('[COMPACTION]')),
+    [messages]
+  );
+
+  // Virtual list setup
+  const virtualizer = useVirtualizer({
+    count: filteredMessages.length,
+    getScrollElement: () => messagesContainerRef.current,
+    estimateSize: (index) => {
+      const msg = filteredMessages[index];
+      if (msg.role === 'user') return 72;
+      if (msg.role === 'system') return 52;
+      // Assistant: estimate from content
+      const contentLength = msg.content?.length || 0;
+      const blockCount = msg.contentBlocks?.length || 1;
+      return Math.max(100, Math.min(800, contentLength * 0.3 + blockCount * 80));
+    },
+    overscan: 5,
+  });
+
+  // Auto-scroll to bottom when new messages are added
   useEffect(() => {
-    if (!userHasScrolled && messagesEndRef.current) {
-      messagesEndRef.current.scrollIntoView({ behavior: 'smooth' });
+    if (!userHasScrolled && filteredMessages.length > 0) {
+      // Use requestAnimationFrame to wait for virtualizer to measure
+      requestAnimationFrame(() => {
+        // On initial load, jump instantly to the bottom; afterwards scroll smoothly
+        const behavior = initialScrollDoneRef.current ? 'smooth' : 'auto';
+        virtualizer.scrollToIndex(filteredMessages.length - 1, { align: 'end', behavior });
+        initialScrollDoneRef.current = true;
+      });
     }
-  }, [messages, streamingBlocks, userHasScrolled]);
+  }, [filteredMessages.length, userHasScrolled]);
 
-  // Focus input on mount
+  // Auto-scroll during streaming (streaming area is below virtual list)
   useEffect(() => {
-    inputRef.current?.focus();
-  }, []);
-
-  // Handle scroll to detect user scrolling
-  const handleScroll = (): void => {
-    if (!messagesContainerRef.current) return;
-
-    const { scrollTop, scrollHeight, clientHeight } = messagesContainerRef.current;
-    const isAtBottom = scrollHeight - scrollTop - clientHeight < 100;
-
-    // If user scrolls away from bottom, stop auto-scrolling
-    if (!isAtBottom && (isStreaming || isLoading)) {
-      setUserHasScrolled(true);
+    if (!userHasScrolled && isStreaming && messagesContainerRef.current) {
+      const el = messagesContainerRef.current;
+      el.scrollTop = el.scrollHeight;
     }
+  }, [streamingBlocks, userHasScrolled, isStreaming]);
 
-    // If user scrolls back to bottom, resume auto-scrolling
-    if (isAtBottom) {
-      setUserHasScrolled(false);
-    }
-  };
+  // Remeasure when panel opens/closes (width changes)
+  useEffect(() => {
+    virtualizer.measure();
+  }, [panelOpen]);
 
-  // Get synthesis response using the new API with tools
+  // Throttled scroll handler using refs to avoid stale closures
+  const handleScroll = useMemo(
+    () => throttle((): void => {
+      if (!messagesContainerRef.current) return;
+
+      const { scrollTop, scrollHeight, clientHeight } = messagesContainerRef.current;
+      const isAtBottom = scrollHeight - scrollTop - clientHeight < 100;
+
+      if (!isAtBottom && (isStreamingRef.current || isLoadingRef.current)) {
+        setUserHasScrolled(true);
+      }
+
+      if (isAtBottom) {
+        setUserHasScrolled(false);
+      }
+    }, 100),
+    []
+  );
+
+  // Get synthesis response via Claude Code subprocess
   const getSynthesisResponse = useCallback(async (
-    chatMessages: Array<{ role: 'user' | 'assistant' | 'system'; content: string }>
+    messageText: string
   ): Promise<void> => {
     // Clean up any previous active stream
     if (activeStreamCleanupRef.current) {
@@ -472,7 +625,7 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
     setIsSearching(false);
     setSearchQuery('');
     setSearchResults([]);
-    setProposalStatuses(new Map());
+    setProposalStatuses({});
     setStreamingBlocks([]);
     setUserHasScrolled(false);
 
@@ -484,7 +637,26 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
     let currentRoundNumber = 0;
     let currentThinkingBlockId: string | null = null;
     const blocks: ContentBlock[] = [];
+    activeBlocksRef.current = blocks;
     let currentTextBlockId: string | null = null;
+    // Track whether current blocks have been saved to messages by round_complete.
+    // Blocks are kept in the array so tool_result events can match them.
+    // Cleared when new content arrives for the next round.
+    let roundSaved = false;
+    // DB message ID of the last round_complete save (for updating contentBlocks after tool results)
+    let lastSavedDbMessageId: string | null = null;
+
+    // Clear blocks from a saved round when new content starts
+    const clearSavedRound = (): void => {
+      if (roundSaved) {
+        blocks.length = 0;
+        currentTextBlockId = null;
+        currentThinkingBlockId = null;
+        currentRoundNumber = 0;
+        roundSaved = false;
+        lastSavedDbMessageId = null;
+      }
+    };
 
     // Helper to get or create current text block
     const getOrCreateTextBlock = (): ContentBlock => {
@@ -492,7 +664,6 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
         const existing = blocks.find(b => b.id === currentTextBlockId);
         if (existing) return existing;
       }
-      // Create new text block
       const newBlock: ContentBlock = {
         id: crypto.randomUUID(),
         type: 'text',
@@ -503,19 +674,55 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
       return newBlock;
     };
 
+    // Helper to find parent Task block for sub-agent events
+    const findParentTaskBlock = (parentToolUseId: string): ContentBlock | undefined => {
+      return blocks.find(b => b.type === 'tool_use' && b.id === parentToolUseId);
+    };
+
+    // Helper to find a block by ID across top-level and nested childBlocks
+    const findBlockDeep = (blockId: string): ContentBlock | undefined => {
+      for (const b of blocks) {
+        if (b.id === blockId) return b;
+        if (b.childBlocks) {
+          const child = b.childBlocks.find(c => c.id === blockId);
+          if (child) return child;
+        }
+      }
+      return undefined;
+    };
+
+    // Helper: trigger re-render of saved message containing a specific block ID
+    const rerenderSavedMessage = (blockId: string): void => {
+      setMessages(prev => {
+        for (let i = prev.length - 1; i >= 0; i--) {
+          const msg = prev[i];
+          if (msg.role === 'assistant' && msg.contentBlocks) {
+            if (msg.contentBlocks.some(b => b.id === blockId)) {
+              const updated = [...prev];
+              updated[i] = { ...msg, contentBlocks: [...msg.contentBlocks] };
+              return updated;
+            }
+          }
+        }
+        return prev;
+      });
+    };
+
     try {
       const cleanup = await window.electronAPI.ai.synthesisStream(
         ideaId,
-        chatMessages,
+        messageText,
         // On event
         (event: StreamEvent) => {
           if (!isMountedRef.current) return;
 
           switch (event.type) {
             case 'thinking_start':
-              // Start a new thinking round - add to blocks array for proper ordering
+              // Skip sub-agent thinking — only show tool activity
+              if (event.parentToolUseId) break;
+              clearSavedRound();
               currentRoundNumber++;
-              currentTextBlockId = null; // End any current text block
+              currentTextBlockId = null;
               const thinkingBlock: ContentBlock = {
                 id: crypto.randomUUID(),
                 type: 'thinking',
@@ -531,8 +738,8 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
               break;
 
             case 'thinking':
+              if (event.parentToolUseId) break;
               if (event.content && currentThinkingBlockId) {
-                // Update the current thinking block's content
                 const activeThinking = blocks.find(b => b.id === currentThinkingBlockId);
                 if (activeThinking) {
                   activeThinking.content = (activeThinking.content || '') + event.content;
@@ -542,7 +749,7 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
               break;
 
             case 'thinking_done':
-              // Mark current thinking block as complete
+              if (event.parentToolUseId) break;
               if (currentThinkingBlockId) {
                 const completedThinking = blocks.find(b => b.id === currentThinkingBlockId);
                 if (completedThinking) {
@@ -555,8 +762,10 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
               break;
 
             case 'text':
+              // Skip sub-agent text — it becomes the Task tool result
+              if (event.parentToolUseId) break;
+              clearSavedRound();
               if (event.content) {
-                // Append to current text block
                 const textBlock = getOrCreateTextBlock();
                 textBlock.content = (textBlock.content || '') + event.content;
                 setStreamingBlocks([...blocks]);
@@ -564,41 +773,54 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
               break;
 
             case 'tool_start':
-              // Tool block started streaming - create block immediately in loading state
               if (event.toolId && event.toolName) {
-                // Check if we already have this tool block (avoid duplicates)
-                const existingTool = blocks.find(b => b.id === event.toolId);
-                if (existingTool) {
-                  // Already have this tool, skip
+                // Sub-agent event — nest under parent Task block
+                if (event.parentToolUseId) {
+                  const parentBlock = findParentTaskBlock(event.parentToolUseId);
+                  if (parentBlock) {
+                    if (!parentBlock.childBlocks) parentBlock.childBlocks = [];
+                    const existing = parentBlock.childBlocks.find(c => c.id === event.toolId);
+                    if (!existing) {
+                      parentBlock.childBlocks.push({
+                        id: event.toolId,
+                        type: 'tool_use',
+                        toolName: event.toolName,
+                        toolInput: undefined,
+                        parentToolUseId: event.parentToolUseId
+                      });
+                    }
+                    if (roundSaved) {
+                      rerenderSavedMessage(event.parentToolUseId);
+                    } else {
+                      setStreamingBlocks([...blocks]);
+                    }
+                  }
                   break;
                 }
-                // End current text block
+
+                clearSavedRound();
+                const existingTool = blocks.find(b => b.id === event.toolId);
+                if (existingTool) break;
                 currentTextBlockId = null;
-                // Add tool block in loading state (no input yet)
                 const toolBlock: ContentBlock = {
                   id: event.toolId,
                   type: 'tool_use',
                   toolName: event.toolName,
-                  toolInput: undefined // Input not available yet
+                  toolInput: undefined,
+                  // Timestamp for elapsed timer on Task blocks
+                  _createdAt: Date.now(),
+                  // Initialize childBlocks for Task tool to hold sub-agent activity
+                  ...(event.toolName === 'Task' ? { childBlocks: [] } : {})
                 };
                 blocks.push(toolBlock);
                 setStreamingBlocks([...blocks]);
 
-                // Open panel when update_synthesis tool starts
                 if (event.toolName === 'update_synthesis') {
                   setPanelOpen(true);
                   setPanelLoading(true);
                   setPanelContent('');
                 }
 
-                // Open panel and switch to App tab when file tools are used
-                if (['create_file', 'update_file', 'modify_file_lines'].includes(event.toolName)) {
-                  setPanelOpen(true);
-                  setActivePanelTab('app');
-                  setAppLoading(true);
-                }
-
-                // Open panel and switch to Dependency Nodes tab when node tools are used
                 if (['create_dependency_node', 'update_dependency_node', 'delete_dependency_node', 'connect_dependency_nodes', 'disconnect_dependency_nodes'].includes(event.toolName)) {
                   setPanelOpen(true);
                   setActivePanelTab('dependency-nodes');
@@ -608,28 +830,63 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
               break;
 
             case 'tool_input_delta':
-              // Stream tool input content live into panel
-              if (event.toolName === 'update_synthesis' && event.partialInput) {
-                console.log('[Panel] tool_input_delta received, length:', event.partialInput.length);
-                const extractedContent = extractContentFromPartialJson(event.partialInput);
-                console.log('[Panel] extracted content length:', extractedContent.length);
-                if (extractedContent) {
-                  setPanelContent(extractedContent);
+              if (event.partialInput && event.toolId) {
+                // Find tool block — check nested childBlocks for sub-agent events
+                const deltaToolBlock = event.parentToolUseId
+                  ? findParentTaskBlock(event.parentToolUseId)?.childBlocks?.find(c => c.id === event.toolId)
+                  : blocks.find(b => b.id === event.toolId);
+                if (deltaToolBlock) {
+                  if (!deltaToolBlock._rawInput) deltaToolBlock._rawInput = '';
+                  deltaToolBlock._rawInput += event.partialInput;
+
+                  // Try to extract toolInput from partial JSON (best effort)
+                  if (!deltaToolBlock.toolInput) {
+                    try {
+                      deltaToolBlock.toolInput = JSON.parse(deltaToolBlock._rawInput);
+                      setStreamingBlocks([...blocks]);
+                    } catch {
+                      // Not complete JSON yet — try to extract key fields from partial
+                      const raw = deltaToolBlock._rawInput;
+                      const fileMatch = raw.match(/"file_path"\s*:\s*"([^"]+)"/);
+                      const cmdMatch = raw.match(/"command"\s*:\s*"([^"]+)"/);
+                      const patternMatch = raw.match(/"pattern"\s*:\s*"([^"]+)"/);
+                      if (fileMatch || cmdMatch || patternMatch) {
+                        deltaToolBlock.toolInput = {
+                          ...(fileMatch ? { file_path: fileMatch[1] } : {}),
+                          ...(cmdMatch ? { command: cmdMatch[1] } : {}),
+                          ...(patternMatch ? { pattern: patternMatch[1] } : {})
+                        };
+                        setStreamingBlocks([...blocks]);
+                      }
+                    }
+                  }
+                }
+
+                // Special handling for update_synthesis panel content
+                if (event.toolName === 'update_synthesis') {
+                  const extractedContent = extractContentFromPartialJson(event.partialInput);
+                  if (extractedContent) {
+                    setPanelContent(extractedContent);
+                  }
                 }
               }
               break;
 
             case 'tool_use':
-              // Tool block complete - update with full input
               if (event.toolCall) {
-                // Find existing tool block (created by tool_start) and update with full input
-                const existingTool = blocks.find(b => b.id === event.toolCall!.id);
+                // Find tool block — check nested childBlocks for sub-agent events
+                const existingTool = event.parentToolUseId
+                  ? findParentTaskBlock(event.parentToolUseId)?.childBlocks?.find(c => c.id === event.toolCall!.id)
+                  : blocks.find(b => b.id === event.toolCall!.id);
                 if (existingTool) {
                   existingTool.toolInput = event.toolCall.input;
-                  setStreamingBlocks([...blocks]);
+                  if (roundSaved && event.parentToolUseId) {
+                    rerenderSavedMessage(event.parentToolUseId);
+                  } else {
+                    setStreamingBlocks([...blocks]);
+                  }
                 }
 
-                // Update synthesis panel content when update_synthesis tool completes
                 if (event.toolCall.name === 'update_synthesis' && event.toolCall.input.content) {
                   setPanelContent(event.toolCall.input.content as string);
                   setPanelLoading(false);
@@ -639,43 +896,55 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
 
             case 'tool_result':
               if (event.result) {
-                // Find the tool block by ID (preferred) or name as fallback
-                const toolBlock = blocks.find(
-                  b => b.type === 'tool_use' &&
-                       (event.toolId ? b.id === event.toolId : b.toolName === event.toolName) &&
-                       !b.toolResult
-                );
+                // Find matching tool block — check nested childBlocks for sub-agent events
+                let toolBlock: ContentBlock | undefined;
+                if (event.parentToolUseId) {
+                  const parentBlock = findParentTaskBlock(event.parentToolUseId);
+                  toolBlock = parentBlock?.childBlocks?.find(
+                    c => c.type === 'tool_use' &&
+                         (event.toolId ? c.id === event.toolId : c.toolName === event.toolName) &&
+                         !c.toolResult
+                  );
+                } else {
+                  toolBlock = blocks.find(
+                    b => b.type === 'tool_use' &&
+                         (event.toolId ? b.id === event.toolId : b.toolName === event.toolName) &&
+                         !b.toolResult
+                  );
+                }
                 if (toolBlock) {
                   toolBlock.toolResult = event.result;
-                  setStreamingBlocks([...blocks]);
-                }
 
-                // Refresh app files after file operations complete
-                if (event.result.success && ['create_file', 'update_file', 'modify_file_lines', 'delete_file', 'set_entry_file'].includes(event.toolName || '')) {
-                  // Use setTimeout to avoid state update conflicts
-                  setTimeout(() => {
-                    if (isMountedRef.current) {
-                      loadAppFiles();
-                      setAppLoading(false);
+                  if (roundSaved) {
+                    // Round already saved to messages — blocks are shared references,
+                    // so the mutation above updated both. Trigger re-render of saved messages.
+                    // For sub-agent events, search by parent Task block ID.
+                    const searchId = event.parentToolUseId || toolBlock.id;
+                    rerenderSavedMessage(searchId);
+
+                    // Persist the updated contentBlocks (with toolResult) to the database
+                    if (lastSavedDbMessageId) {
+                      window.electronAPI.db.updateMessageContentBlocks(lastSavedDbMessageId, [...blocks])
+                        .catch(err => console.error('[IdeaChat] Failed to update tool result in DB:', err));
                     }
-                  }, 0);
+                  } else {
+                    // Round not yet saved — update streaming blocks
+                    setStreamingBlocks([...blocks]);
+                  }
                 }
 
-                // Refresh dependency nodes after node operations complete
+                // Clear panel loading when update_synthesis completes
+                if (event.toolName === 'update_synthesis' || toolBlock?.toolName === 'update_synthesis') {
+                  setPanelLoading(false);
+                }
+
                 if (event.result.success && ['create_dependency_node', 'update_dependency_node', 'delete_dependency_node', 'connect_dependency_nodes', 'disconnect_dependency_nodes'].includes(event.toolName || '')) {
-                  // Use setTimeout to avoid state update conflicts
-                  setTimeout(() => {
-                    if (isMountedRef.current) {
-                      loadDependencyNodes();
-                      setDependencyNodesLoading(false);
-                    }
-                  }, 0);
+                  loadDependencyNodesDebounced();
                 }
               }
               break;
 
             case 'web_search':
-              // AI started a web search
               console.log('[WebSearch] Received web_search event:', event);
               setIsSearching(true);
               setSearchQuery(event.searchQuery || 'Searching...');
@@ -683,7 +952,6 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
               break;
 
             case 'web_search_result':
-              // Web search completed with results
               console.log('[WebSearch] Received web_search_result event:', event);
               setIsSearching(false);
               if (event.searchResults) {
@@ -692,15 +960,11 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
               break;
 
             case 'note_proposal':
-              // AI proposed adding a note - attach to the corresponding propose_note tool block
-              // Match by toolId for accuracy when multiple proposals arrive at once
               if (event.proposal) {
-                // First try to match by toolId (most accurate)
                 let proposalToolBlock = event.toolId
                   ? blocks.find(b => b.id === event.toolId && b.type === 'tool_use')
                   : null;
 
-                // Fallback: find first propose_note tool without a proposal
                 if (!proposalToolBlock) {
                   proposalToolBlock = blocks.find(
                     b => b.type === 'tool_use' &&
@@ -713,7 +977,6 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
                   proposalToolBlock.proposal = event.proposal;
                   setStreamingBlocks([...blocks]);
                 } else {
-                  // Tool block might not exist yet - create a placeholder
                   const placeholderBlock: ContentBlock = {
                     id: event.toolId || crypto.randomUUID(),
                     type: 'tool_use',
@@ -727,12 +990,105 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
               }
               break;
 
+            case 'round_complete': {
+              // Skip sub-agent round_complete — internal to sub-agent
+              if (event.parentToolUseId) break;
+              const roundTextContent = blocks.filter(b => b.type === 'text').map(b => b.content || '').join('');
+              const roundThinkingBlocks = blocks.filter(b => b.type === 'thinking');
+              const roundThinkingContent = roundThinkingBlocks
+                .map((b, idx) => `--- Thought ${idx + 1} ---\n${b.content}`)
+                .join('\n\n');
+
+              if (blocks.length > 0) {
+                const roundMsg: ChatMessage = {
+                  id: crypto.randomUUID(),
+                  role: 'assistant',
+                  content: roundTextContent,
+                  createdAt: new Date(),
+                  thinking: roundThinkingContent || undefined,
+                  contentBlocks: [...blocks]
+                };
+                setMessages(prev => [...prev, roundMsg]);
+
+                window.electronAPI.db.addMessage({
+                  conversationId: effectiveConversationId,
+                  role: 'assistant',
+                  content: roundTextContent,
+                  thinking: roundThinkingContent || undefined,
+                  contentBlocks: [...blocks],
+                  inputTokens: streamTokensRef.current.input > 0 ? streamTokensRef.current.input : undefined,
+                  outputTokens: streamTokensRef.current.output > 0 ? streamTokensRef.current.output : undefined
+                }).then(savedMsg => {
+                  // Track DB message ID so tool_result events can update it
+                  lastSavedDbMessageId = savedMsg.id;
+                }).catch(err => console.error('[IdeaChat] Failed to save round message:', err));
+              }
+
+              // Don't clear blocks yet — tool_result events arrive AFTER round_complete.
+              // Keep blocks so tool results can match them. clearSavedRound() will
+              // clean up when the next round's content starts.
+              roundSaved = true;
+              setStreamingBlocks([]);
+              streamTokensRef.current = { input: 0, output: 0 };
+              setLiveStreamingTokens({ input: 0, output: 0 });
+              break;
+            }
+
+            case 'error_user_message': {
+              if (event.content) {
+                const errorUserMsg: ChatMessage = {
+                  id: crypto.randomUUID(),
+                  role: 'user',
+                  content: event.content,
+                  createdAt: new Date()
+                };
+                setMessages(prev => [...prev, errorUserMsg]);
+
+                window.electronAPI.db.addMessage({
+                  conversationId: effectiveConversationId,
+                  role: 'user',
+                  content: event.content
+                }).catch(err => console.error('[IdeaChat] Failed to save error message:', err));
+              }
+              break;
+            }
+
+            case 'compact_status':
+              setIsCompacting(event.compacting ?? false);
+              break;
+
+            case 'compact_boundary':
+              setIsCompacting(false);
+              // Insert a compaction divider message into the chat
+              setMessages(prev => [...prev, {
+                id: `compaction-${Date.now()}`,
+                role: 'system' as const,
+                content: '[COMPACTION]',
+                createdAt: new Date()
+              }]);
+              break;
+
+            case 'tool_progress': {
+              // Update elapsed time on the matching tool block (top-level or nested)
+              if (event.toolId) {
+                const progressBlock = findBlockDeep(event.toolId);
+                if (progressBlock) {
+                  progressBlock.elapsedSeconds = event.elapsedSeconds;
+                  setStreamingBlocks([...blocks]);
+                }
+              }
+              break;
+            }
+
+            case 'subagent_done':
+              // Task notification — sub-agent completed. The tool_result for the
+              // Task block will handle marking it done. Nothing extra needed here.
+              break;
+
             case 'done':
-              // Streaming complete for this round - capture token usage for database
               if (event.usage) {
                 streamTokensRef.current.input += event.usage.inputTokens;
                 streamTokensRef.current.output += event.usage.outputTokens;
-                // Also update live streaming tokens for real-time stats display
                 setLiveStreamingTokens({
                   input: streamTokensRef.current.input,
                   output: streamTokensRef.current.output
@@ -745,73 +1101,108 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
         async () => {
           if (!isMountedRef.current) return;
 
-          // Clear the cleanup ref since stream ended naturally
+          // Remove IPC event listener to prevent duplicate handlers on next stream
+          if (activeStreamCleanupRef.current) {
+            activeStreamCleanupRef.current();
+          }
           activeStreamCleanupRef.current = null;
 
           setIsStreaming(false);
           setIsThinking(false);
-          setAppLoading(false);
+          setIsCompacting(false);
           setDependencyNodesLoading(false);
 
-          // Refresh app files and dependency nodes in case any tools were used
-          await loadAppFiles();
           await loadDependencyNodes();
 
-          // Combine all text content for storage
+          // Build snapshot block if one was created
+          const snapshotBlock: ContentBlock | null = pendingSnapshotRef.current ? {
+            id: `snapshot-${pendingSnapshotRef.current.snapshotId}`,
+            type: 'version_snapshot',
+            versionNumber: pendingSnapshotRef.current.versionNumber,
+            snapshotId: pendingSnapshotRef.current.snapshotId
+          } : null;
+          pendingSnapshotRef.current = null;
+
+          if (snapshotBlock) {
+            blocks.push(snapshotBlock);
+          }
+
           const fullTextContent = blocks
             .filter(b => b.type === 'text')
             .map(b => b.content || '')
             .join('');
 
-          // Combine all thinking blocks into a single string for storage
-          // Format: each round separated by a marker
           const thinkingBlocks = blocks.filter(b => b.type === 'thinking');
           const fullThinkingContent = thinkingBlocks
             .map((block, idx) => `--- Thought ${idx + 1} ---\n${block.content}`)
             .join('\n\n');
 
-          // Create assistant message with all content blocks (including thinking for proper ordering)
-          const assistantMessage: ChatMessage = {
-            id: crypto.randomUUID(),
-            role: 'assistant',
-            content: fullTextContent,
-            createdAt: new Date(),
-            thinking: fullThinkingContent || undefined, // Keep for backwards compatibility
-            contentBlocks: blocks.length > 0 ? [...blocks] : undefined
-          };
+          if (roundSaved && snapshotBlock) {
+            // round_complete already saved this round's blocks — save snapshot as its own message
+            const snapshotMsg: ChatMessage = {
+              id: crypto.randomUUID(),
+              role: 'assistant',
+              content: '',
+              createdAt: new Date(),
+              contentBlocks: [snapshotBlock]
+            };
+            setMessages(prev => [...prev, snapshotMsg]);
+            await window.electronAPI.db.addMessage({
+              conversationId: effectiveConversationId,
+              role: 'assistant',
+              content: '',
+              contentBlocks: [snapshotBlock]
+            });
+          } else if (!roundSaved && (blocks.length > 0 || fullTextContent.length > 0)) {
+            // Save unsaved content (no round_complete fired for this round)
+            const assistantMessage: ChatMessage = {
+              id: crypto.randomUUID(),
+              role: 'assistant',
+              content: fullTextContent,
+              createdAt: new Date(),
+              thinking: fullThinkingContent || undefined,
+              contentBlocks: blocks.length > 0 ? [...blocks] : undefined
+            };
 
-          setMessages(prev => [...prev, assistantMessage]);
+            setMessages(prev => [...prev, assistantMessage]);
+
+            await window.electronAPI.db.addMessage({
+              conversationId: effectiveConversationId,
+              role: 'assistant',
+              content: fullTextContent,
+              thinking: fullThinkingContent || undefined,
+              contentBlocks: blocks.length > 0 ? blocks : undefined,
+              inputTokens: streamTokensRef.current.input > 0 ? streamTokensRef.current.input : undefined,
+              outputTokens: streamTokensRef.current.output > 0 ? streamTokensRef.current.output : undefined
+            });
+          }
+
           setCurrentThinkingRound(0);
           setSearchQuery('');
           setSearchResults([]);
           setIsSearching(false);
           setStreamingBlocks([]);
-
-          // Save to database with all contentBlocks and token usage
-          await window.electronAPI.db.addMessage({
-            conversationId,
-            role: 'assistant',
-            content: fullTextContent,
-            thinking: fullThinkingContent || undefined, // Keep for backwards compatibility
-            contentBlocks: blocks.length > 0 ? blocks : undefined,
-            inputTokens: streamTokensRef.current.input > 0 ? streamTokensRef.current.input : undefined,
-            outputTokens: streamTokensRef.current.output > 0 ? streamTokensRef.current.output : undefined
-          });
+          // Trigger dev server restart so preview shows latest code
+          setPreviewRefreshKey(prev => prev + 1);
         },
         // On error
         (errorMsg: string) => {
           if (!isMountedRef.current) return;
 
+          // Remove IPC event listener to prevent duplicate handlers on next stream
+          if (activeStreamCleanupRef.current) {
+            activeStreamCleanupRef.current();
+          }
           activeStreamCleanupRef.current = null;
           setIsStreaming(false);
           setIsThinking(false);
+          setIsCompacting(false);
           setError(errorMsg);
           setCurrentThinkingRound(0);
           setStreamingBlocks([]);
         }
       );
 
-      // Store the cleanup function
       activeStreamCleanupRef.current = cleanup;
     } catch (err) {
       if (isMountedRef.current) {
@@ -821,12 +1212,10 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
         setError(errorMessage);
       }
     }
-  }, [ideaId, conversationId]);
+  }, [ideaId, effectiveConversationId]);
 
-  // Auto-start synthesis for new conversations (triggered by "Synthesize Idea" button)
-  // This runs after messages are loaded and getSynthesisResponse is available
+  // Auto-start synthesis for new conversations
   useEffect(() => {
-    // Only trigger for new conversations with no user/assistant messages yet
     if (
       isNewConversation &&
       messagesLoaded &&
@@ -834,60 +1223,46 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
       !isStreaming &&
       !isLoading
     ) {
-      // Check if we only have system message (no actual conversation yet)
       const hasOnlySystemMessage = messages.length > 0 &&
         messages.every(m => m.role === 'system');
 
       if (hasOnlySystemMessage) {
         hasStartedSynthesisRef.current = true;
 
-        // Initial trigger message for synthesis (not shown in UI)
-        // Claude API requires at least one user message
         const triggerContent = 'Analizează ideile și fa sinteza lor într-o idee. Nu propune note - doar sintetizează.';
 
-        // Prepare messages including the trigger message (don't add to UI state)
-        const initialMessages = [
-          ...messages.map(m => ({ role: m.role, content: m.content })),
-          { role: 'user' as const, content: triggerContent }
-        ];
-
-        getSynthesisResponse(initialMessages);
+        getSynthesisResponse(triggerContent);
       }
     }
-  }, [isNewConversation, messagesLoaded, messages, isStreaming, isLoading, getSynthesisResponse, conversationId]);
+  }, [isNewConversation, messagesLoaded, messages, isStreaming, isLoading, getSynthesisResponse, effectiveConversationId]);
 
-  // Handle sending a message
-  const handleSend = async (): Promise<void> => {
-    if (!inputValue.trim() || isLoading || isStreaming) return;
+  // Handle sending a message (called by ChatInput with text)
+  const handleSend = useCallback(async (text: string): Promise<void> => {
+    if (!text.trim() || isLoading || isStreaming) return;
+
+    const trimmedInput = text.trim();
 
     const userMessage: ChatMessage = {
       id: crypto.randomUUID(),
       role: 'user',
-      content: inputValue.trim(),
+      content: trimmedInput,
       createdAt: new Date()
     };
 
-    setInputValue('');
     setMessages(prev => [...prev, userMessage]);
     setIsLoading(true);
     setError(null);
     setUserHasScrolled(false);
 
     try {
-      // Save user message to database
       await window.electronAPI.db.addMessage({
-        conversationId,
+        conversationId: effectiveConversationId,
         role: 'user',
         content: userMessage.content
       });
 
-      // Get response - all tools always available
-      const allMessages = [...messages, userMessage].map(m => ({
-        role: m.role,
-        content: m.content
-      }));
-
-      await getSynthesisResponse(allMessages);
+      // Claude Code manages context via session IDs — just send the current message text
+      await getSynthesisResponse(trimmedInput);
 
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : 'Failed to send message';
@@ -895,54 +1270,77 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
     } finally {
       setIsLoading(false);
     }
-  };
-
-  // Handle key press in input
-  const handleKeyPress = (e: React.KeyboardEvent<HTMLTextAreaElement>): void => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      handleSend();
-    }
-  };
+  }, [isLoading, isStreaming, messages, effectiveConversationId, getSynthesisResponse]);
 
   // Handle stop/abort streaming
-  const handleStop = async (): Promise<void> => {
+  const handleStop = useCallback(async (): Promise<void> => {
     try {
-      // Clean up any active stream listener
       if (activeStreamCleanupRef.current) {
         activeStreamCleanupRef.current();
         activeStreamCleanupRef.current = null;
       }
 
-      // Send abort signal to the main process
       await window.electronAPI.ai.abortSynthesis(ideaId);
 
-      // Reset all loading/streaming states
+      const currentBlocks = activeBlocksRef.current;
+      if (currentBlocks && currentBlocks.length > 0) {
+        const fullTextContent = currentBlocks
+          .filter(b => b.type === 'text')
+          .map(b => b.content || '')
+          .join('');
+        const thinkingBlocks = currentBlocks.filter(b => b.type === 'thinking');
+        const fullThinkingContent = thinkingBlocks
+          .map((b, i) => `--- Thought ${i + 1} ---\n${b.content}`)
+          .join('\n\n');
+
+        const partialMessage: ChatMessage = {
+          id: crypto.randomUUID(),
+          role: 'assistant',
+          content: fullTextContent,
+          createdAt: new Date(),
+          thinking: fullThinkingContent || undefined,
+          contentBlocks: [...currentBlocks]
+        };
+
+        setMessages(prev => [...prev, partialMessage]);
+
+        window.electronAPI.db.addMessage({
+          conversationId: effectiveConversationId,
+          role: 'assistant',
+          content: fullTextContent,
+          thinking: fullThinkingContent || undefined,
+          contentBlocks: [...currentBlocks]
+        }).catch(err => console.error('[IdeaChat] Failed to save partial message:', err));
+      }
+
+      activeBlocksRef.current = [];
       setIsStreaming(false);
       setIsLoading(false);
       setIsThinking(false);
-      setAppLoading(false);
       setDependencyNodesLoading(false);
       setPanelLoading(false);
       setCurrentThinkingRound(0);
       setIsSearching(false);
-
-      // Keep the streaming blocks as they are (partial content is still useful)
+      setStreamingBlocks([]);
     } catch (err) {
       console.error('Failed to stop synthesis:', err);
     }
-  };
+  }, [ideaId, effectiveConversationId]);
 
   // Track if we should auto-send after recording (for wake word)
   const autoSendAfterRecordingRef = useRef<boolean>(false);
 
   // Start voice recording
-  const startRecording = async (autoSend = false): Promise<void> => {
+  const startRecording = useCallback(async (autoSend = false): Promise<void> => {
     try {
       setError(null);
       autoSendAfterRecordingRef.current = autoSend;
 
+      cleanupAudioStream();
+
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      audioStreamRef.current = stream;
+      console.log('[IdeaChat] Microphone stream acquired');
 
       const mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
       audioChunksRef.current = [];
@@ -954,7 +1352,8 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
       };
 
       mediaRecorder.onstop = async () => {
-        stream.getTracks().forEach(track => track.stop());
+        console.log('[IdeaChat] MediaRecorder stopped');
+        cleanupAudioStream();
         await processRecording();
       };
 
@@ -962,19 +1361,31 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
       mediaRecorder.start();
       setIsRecording(true);
     } catch (err) {
+      cleanupAudioStream();
       setError('Could not access microphone. Please grant permission.');
       console.error('Microphone error:', err);
     }
-  };
+  }, []);
 
   // Stop voice recording
-  const stopRecording = (): void => {
+  const stopRecording = useCallback((): void => {
+    console.log('[IdeaChat] Stop recording called');
     if (mediaRecorderRef.current && isRecording) {
-      mediaRecorderRef.current.stop();
+      try {
+        mediaRecorderRef.current.stop();
+        setIsRecording(false);
+        setIsProcessingAudio(true);
+      } catch (err) {
+        console.error('[IdeaChat] Error stopping recorder:', err);
+        cleanupAudioStream();
+        setIsRecording(false);
+        setIsProcessingAudio(false);
+      }
+    } else {
+      cleanupAudioStream();
       setIsRecording(false);
-      setIsProcessingAudio(true);
     }
-  };
+  }, [isRecording]);
 
   // Process recorded audio through STT
   const processRecording = async (): Promise<void> => {
@@ -988,12 +1399,10 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
       if (result.text && result.text.trim()) {
         const transcribedText = result.text.trim();
 
-        // If auto-send is enabled (from wake word), send directly
         if (autoSendAfterRecordingRef.current) {
           autoSendAfterRecordingRef.current = false;
           setIsProcessingAudio(false);
 
-          // Create and send the message directly
           const userMessage: ChatMessage = {
             id: crypto.randomUUID(),
             role: 'user',
@@ -1005,28 +1414,24 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
           setIsLoading(true);
           setUserHasScrolled(false);
 
-          // Save user message to database
           await window.electronAPI.db.addMessage({
-            conversationId,
+            conversationId: effectiveConversationId,
             role: 'user',
             content: userMessage.content
           });
 
-          // Get response
           const allMessages = [...messages, userMessage].map(m => ({
             role: m.role,
-            content: m.content
+            content: m.content,
+            thinking: m.thinking,
+            contentBlocks: m.contentBlocks
           }));
 
           await getSynthesisResponse(allMessages);
           setIsLoading(false);
         } else {
-          // Normal mode - just append to input
-          setInputValue(prev => {
-            const newValue = prev ? `${prev} ${transcribedText}` : transcribedText;
-            return newValue;
-          });
-          inputRef.current?.focus();
+          // Normal mode - pass to ChatInput via pending transcription
+          setPendingTranscription(transcribedText);
           setIsProcessingAudio(false);
         }
       } else {
@@ -1041,75 +1446,139 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
     }
   };
 
-  // Format tool name for display
-  const formatToolName = (name: string): string => {
-    return name.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
-  };
+  // Clear pending transcription after ChatInput consumes it
+  const handleTranscriptionConsumed = useCallback(() => {
+    setPendingTranscription(null);
+  }, []);
 
-  // Markdown components styling for AI responses
-  /* eslint-disable @typescript-eslint/no-explicit-any */
-  const markdownComponents: Record<string, React.ComponentType<any>> = {
-    h1: ({ children }: any) => (
-      <h1 className="text-2xl font-semibold text-blue-50 mt-6 mb-3">{children}</h1>
-    ),
-    h2: ({ children }: any) => (
-      <h2 className="text-xl font-semibold text-blue-50 mt-5 mb-2">{children}</h2>
-    ),
-    h3: ({ children }: any) => (
-      <h3 className="text-lg font-medium text-blue-50 mt-4 mb-2">{children}</h3>
-    ),
-    h4: ({ children }: any) => (
-      <h4 className="text-base font-medium text-blue-100 mt-3 mb-1">{children}</h4>
-    ),
-    p: ({ children }: any) => (
-      <p className="text-blue-100 leading-relaxed mb-3">{children}</p>
-    ),
-    ul: ({ children }: any) => (
-      <ul className="list-disc list-outside ml-5 mb-3 space-y-1 text-blue-100">{children}</ul>
-    ),
-    ol: ({ children }: any) => (
-      <ol className="list-decimal list-outside ml-5 mb-3 space-y-1 text-blue-100">{children}</ol>
-    ),
-    li: ({ children }: any) => (
-      <li className="text-blue-100">{children}</li>
-    ),
-    strong: ({ children }: any) => (
-      <strong className="font-semibold text-blue-50">{children}</strong>
-    ),
-    em: ({ children }: any) => (
-      <em className="italic text-blue-200">{children}</em>
-    ),
-    code: ({ children, className }: any) => {
-      const isInline = !className;
-      if (isInline) {
-        return (
-          <code className="px-1.5 py-0.5 bg-[#1e3a5f] rounded text-sky-300 text-sm font-mono">
-            {children}
-          </code>
-        );
+  // ─── Voice Agent: invisible recording → STT → Haiku DOM navigation ───
+
+  // Start invisible recording for voice agent (no UI indicator)
+  const startVoiceAgentRecording = useCallback(async () => {
+    try {
+      // Cleanup any previous voice agent stream
+      if (voiceAgentStreamRef.current) {
+        voiceAgentStreamRef.current.getTracks().forEach(t => t.stop());
+        voiceAgentStreamRef.current = null;
       }
-      return (
-        <code className="text-sky-300 font-mono text-sm">{children}</code>
+      voiceAgentRecorderRef.current = null;
+
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      voiceAgentStreamRef.current = stream;
+
+      const recorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+      voiceAgentChunksRef.current = [];
+
+      recorder.ondataavailable = (event: BlobEvent) => {
+        if (event.data.size > 0) {
+          voiceAgentChunksRef.current.push(event.data);
+        }
+      };
+
+      recorder.onstop = async () => {
+        console.log('[VoiceAgent] Recording stopped, transcribing...');
+        // Cleanup mic stream
+        if (voiceAgentStreamRef.current) {
+          voiceAgentStreamRef.current.getTracks().forEach(t => t.stop());
+          voiceAgentStreamRef.current = null;
+        }
+        voiceAgentRecorderRef.current = null;
+
+        // Transcribe the audio
+        try {
+          const audioBlob = new Blob(voiceAgentChunksRef.current, { type: 'audio/webm' });
+          const arrayBuffer = await audioBlob.arrayBuffer();
+          const audioData = Array.from(new Uint8Array(arrayBuffer));
+
+          const result = await window.electronAPI.stt.transcribe(audioData, 'audio/webm');
+          if (result.text && result.text.trim()) {
+            const command = result.text.trim();
+            console.log('[VoiceAgent] Transcribed command:', command);
+            runVoiceAgentCommand(command);
+          } else {
+            console.log('[VoiceAgent] No text transcribed');
+            setIsVoiceAgentRecording(false);
+          }
+        } catch (err) {
+          console.error('[VoiceAgent] Transcription error:', err);
+          setIsVoiceAgentRecording(false);
+        }
+      };
+
+      voiceAgentRecorderRef.current = recorder;
+      recorder.start();
+      setIsVoiceAgentRecording(true);
+      console.log('[VoiceAgent] Invisible recording started');
+    } catch (err) {
+      console.error('[VoiceAgent] Failed to start recording:', err);
+    }
+  }, []);
+
+  // Stop invisible recording (triggers onstop → transcribe → voice agent)
+  const stopVoiceAgentRecording = useCallback(() => {
+    // Use ref (not state) to avoid stale closure from wake word effect
+    if (voiceAgentRecorderRef.current) {
+      try {
+        voiceAgentRecorderRef.current.stop();
+        setIsVoiceAgentRecording(false);
+      } catch (err) {
+        console.error('[VoiceAgent] Error stopping recorder:', err);
+        setIsVoiceAgentRecording(false);
+      }
+    }
+  }, []);
+
+  // Run a voice command through the Haiku voice agent
+  const runVoiceAgentCommand = useCallback(async (command: string) => {
+    setIsVoiceAgentRunning(true);
+    setVoiceAgentResponse(null);
+
+    // Clear any existing response timer
+    if (voiceAgentResponseTimerRef.current) {
+      clearTimeout(voiceAgentResponseTimerRef.current);
+      voiceAgentResponseTimerRef.current = null;
+    }
+
+    let responseText = '';
+
+    try {
+      const cleanup = await window.electronAPI.voiceAgent.run(
+        ideaId,
+        command,
+        (event) => {
+          // Accumulate text responses
+          if (event.type === 'text' && event.content) {
+            responseText += event.content;
+            setVoiceAgentResponse(responseText);
+          }
+        },
+        () => {
+          // Stream ended
+          setIsVoiceAgentRunning(false);
+          if (responseText) {
+            setVoiceAgentResponse(responseText);
+          }
+          // Auto-clear response after 5 seconds
+          voiceAgentResponseTimerRef.current = setTimeout(() => {
+            setVoiceAgentResponse(null);
+          }, 5000);
+        },
+        (error) => {
+          console.error('[VoiceAgent] Error:', error);
+          setIsVoiceAgentRunning(false);
+          setVoiceAgentResponse('Error: ' + error);
+          voiceAgentResponseTimerRef.current = setTimeout(() => {
+            setVoiceAgentResponse(null);
+          }, 5000);
+        }
       );
-    },
-    pre: ({ children }: any) => (
-      <pre className="bg-[#0d1f3c] rounded-lg p-4 my-3 overflow-x-auto border border-[#1e3a5f]">
-        {children}
-      </pre>
-    ),
-    blockquote: ({ children }: any) => (
-      <blockquote className="border-l-4 border-sky-500 pl-4 my-3 text-blue-200 italic">
-        {children}
-      </blockquote>
-    ),
-    a: ({ href, children }: any) => (
-      <a href={href} className="text-sky-400 hover:text-sky-300 underline" target="_blank" rel="noopener noreferrer">
-        {children}
-      </a>
-    ),
-    hr: () => <hr className="my-4 border-[#1e3a5f]" />
-  };
-  /* eslint-enable @typescript-eslint/no-explicit-any */
+
+      voiceAgentCleanupRef.current = cleanup;
+    } catch (err) {
+      console.error('[VoiceAgent] Failed to run command:', err);
+      setIsVoiceAgentRunning(false);
+    }
+  }, [ideaId]);
 
   return (
     <div className="h-screen flex flex-col bg-[#0a1628] overflow-hidden">
@@ -1128,7 +1597,7 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
         <h1 className="text-xl font-light text-blue-50">Idea Synthesis</h1>
 
         <div className="flex items-center gap-2">
-          {/* Wake word toggle button - "Hey Ben" */}
+          {/* Wake word toggle button */}
           {isWakeWordAvailable && (
             <button
               onClick={() => setIsWakeWordEnabled(!isWakeWordEnabled)}
@@ -1138,18 +1607,35 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
                   : 'text-blue-300 hover:text-emerald-400 hover:bg-[#1e3a5f]'
               }`}
               aria-label="Toggle voice activation"
-              title={isWakeWordEnabled ? 'Voice active - say "Hey Ben" to start, "Gata Ben" to send' : 'Enable voice activation'}
+              title={isWakeWordEnabled ? 'Voice active - say "Alexa" to start/stop recording' : 'Enable voice activation'}
             >
               <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
                       d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
               </svg>
-              <span className="text-sm">Hey Ben</span>
+              <span className="text-sm">Alexa</span>
               {isWakeWordEnabled && (
                 <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
               )}
             </button>
           )}
+
+          {/* Tree button */}
+          <button
+            onClick={handleOpenTree}
+            className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-blue-300 hover:text-emerald-400 hover:bg-[#1e3a5f] transition-colors"
+            aria-label="Conversation tree"
+            title="Open conversation tree"
+          >
+            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                    d="M12 20v-8m0 0V8m0 4l-5-5m5 5l5-5" />
+              <circle cx="7" cy="3" r="2" strokeWidth={2} />
+              <circle cx="17" cy="3" r="2" strokeWidth={2} />
+              <circle cx="12" cy="20" r="2" strokeWidth={2} />
+            </svg>
+            <span className="text-sm">Tree</span>
+          </button>
 
           {/* Panel toggle button */}
           <button
@@ -1187,206 +1673,61 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
             panelOpen ? 'pr-[calc(43%+1rem)]' : ''
           }`}
         >
-        <div className={`mx-auto space-y-6 transition-all duration-300 ease-in-out ${
-          panelOpen ? 'max-w-2xl' : 'max-w-4xl'
-        }`}>
-          {messages.filter(m => m.role !== 'system').map((message) => (
-            <div key={message.id}>
-              {message.role === 'user' ? (
-                // User message - keep bubble style
-                <div className="flex justify-end">
-                  <div className="max-w-[85%] rounded-2xl px-5 py-3 bg-sky-600 text-white">
-                    <p className="leading-relaxed">{message.content}</p>
+          <div className={`mx-auto transition-all duration-300 ease-in-out ${
+            panelOpen ? 'max-w-2xl' : 'max-w-4xl'
+          }`}>
+            {/* Virtualized message list */}
+            <div
+              style={{
+                height: `${virtualizer.getTotalSize()}px`,
+                width: '100%',
+                position: 'relative',
+              }}
+            >
+              {virtualizer.getVirtualItems().map(virtualRow => (
+                <div
+                  key={filteredMessages[virtualRow.index].id}
+                  data-index={virtualRow.index}
+                  ref={virtualizer.measureElement}
+                  style={{
+                    position: 'absolute',
+                    top: 0,
+                    left: 0,
+                    width: '100%',
+                    transform: `translateY(${virtualRow.start}px)`,
+                  }}
+                >
+                  <div className="pb-6">
+                    <MessageItem
+                      message={filteredMessages[virtualRow.index]}
+                      proposalStatuses={proposalStatuses}
+                      onAcceptProposal={handleAcceptProposal}
+                      onRejectProposal={handleRejectProposal}
+                      onViewSnapshot={handleViewSnapshot}
+                      onRestoreSnapshot={handleRestoreSnapshot}
+                    />
                   </div>
                 </div>
-              ) : (
-                // Assistant message - flat style without background
-                <div className="space-y-2">
-                  {/* Render content blocks in order if available (includes thinking, tools, text) */}
-                  {message.contentBlocks && message.contentBlocks.length > 0 ? (
-                    message.contentBlocks.map((block, index) => {
-                      if (block.type === 'thinking') {
-                        // Thinking block - rendered in order with other blocks
-                        return (
-                          <ThinkingBlock
-                            key={block.id}
-                            content={block.content || ''}
-                            isThinking={false}
-                            roundNumber={block.roundNumber || index + 1}
-                          />
-                        );
-                      } else if (block.type === 'tool_use') {
-                        // Special handling for propose_note - render ProposedNoteBlock
-                        if (block.toolName === 'propose_note' && block.proposal) {
-                          const status = proposalStatuses.get(block.proposal.id);
-                          return (
-                            <ProposedNoteBlock
-                              key={block.id}
-                              proposal={block.proposal}
-                              onAccept={handleAcceptProposal}
-                              onReject={handleRejectProposal}
-                              isProcessing={status?.isProcessing}
-                              isAccepted={status?.isAccepted}
-                              isRejected={status?.isRejected}
-                            />
-                          );
-                        }
-                        // Generic tool block
-                        return (
-                          <div key={block.id} className="flex items-start gap-2 text-sm">
-                            <span className={`px-2 py-0.5 rounded text-xs ${
-                              block.toolResult?.success
-                                ? 'bg-emerald-900/50 text-emerald-300'
-                                : 'bg-amber-900/50 text-amber-300'
-                            }`}>
-                              {formatToolName(block.toolName || 'unknown')}
-                            </span>
-                            {block.toolResult?.success && (
-                              <span className="text-blue-300/60 text-xs">completed</span>
-                            )}
-                          </div>
-                        );
-                      } else {
-                        // Text block
-                        return block.content ? (
-                          <div key={block.id} className="prose prose-invert max-w-none">
-                            <ReactMarkdown
-                              remarkPlugins={[remarkGfm]}
-                              components={markdownComponents}
-                            >
-                              {block.content}
-                            </ReactMarkdown>
-                          </div>
-                        ) : null;
-                      }
-                    })
-                  ) : (
-                    // Fallback: render thinking and content directly if no content blocks
-                    <>
-                      {/* Backwards compatibility: show thinking from message.thinking field */}
-                      {message.thinking && (
-                        <ThinkingBlock content={message.thinking} isThinking={false} />
-                      )}
-                      {message.content && (
-                        <div className="prose prose-invert max-w-none">
-                          <ReactMarkdown
-                            remarkPlugins={[remarkGfm]}
-                            components={markdownComponents}
-                          >
-                            {message.content}
-                          </ReactMarkdown>
-                        </div>
-                      )}
-                    </>
-                  )}
-                </div>
-              )}
+              ))}
             </div>
-          ))}
 
-          {/* Streaming response - render blocks in order */}
-          {(isStreaming || isThinking || streamingBlocks.length > 0) && (
-            <div className="space-y-2">
-              {/* Web search block while streaming */}
-              {(isSearching || searchQuery) && (
-                <WebSearchBlock
-                  query={searchQuery}
-                  results={searchResults}
-                  isSearching={isSearching}
-                />
-              )}
+            {/* Streaming area - outside virtual list, always at bottom */}
+            <StreamingArea
+              isStreaming={isStreaming}
+              isThinking={isThinking}
+              isCompacting={isCompacting}
+              streamingBlocks={streamingBlocks}
+              isSearching={isSearching}
+              searchQuery={searchQuery}
+              searchResults={searchResults}
+              proposalStatuses={proposalStatuses}
+              isLoading={isLoading}
+              onAcceptProposal={handleAcceptProposal}
+              onRejectProposal={handleRejectProposal}
+            />
 
-              {/* Render all blocks in order - thinking, tools, and text */}
-              {streamingBlocks.map((block) => {
-                if (block.type === 'thinking') {
-                  // Thinking block - renders in place within the stream
-                  return (
-                    <ThinkingBlock
-                      key={block.id}
-                      content={block.content || ''}
-                      isThinking={block.isThinkingActive || false}
-                      roundNumber={block.roundNumber}
-                    />
-                  );
-                } else if (block.type === 'tool_use') {
-                  // Special handling for propose_note - render ProposedNoteBlock
-                  if (block.toolName === 'propose_note' && block.proposal) {
-                    const status = proposalStatuses.get(block.proposal.id);
-                    return (
-                      <ProposedNoteBlock
-                        key={block.id}
-                        proposal={block.proposal}
-                        onAccept={handleAcceptProposal}
-                        onReject={handleRejectProposal}
-                        isProcessing={status?.isProcessing}
-                        isAccepted={status?.isAccepted}
-                        isRejected={status?.isRejected}
-                      />
-                    );
-                  }
-                  // Generic tool block
-                  return (
-                    <div key={block.id} className="flex items-center gap-2 text-sm">
-                      {!block.toolResult ? (
-                        <svg className="w-4 h-4 animate-spin text-sky-400" fill="none" viewBox="0 0 24 24">
-                          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-                        </svg>
-                      ) : (
-                        <svg className="w-4 h-4 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
-                        </svg>
-                      )}
-                      <span className="px-2 py-0.5 rounded bg-[#1e3a5f] text-sky-300 text-xs">
-                        {formatToolName(block.toolName || 'unknown')}
-                      </span>
-                      <span className="text-blue-300/60 text-xs">
-                        {block.toolResult ? 'completed' : 'running...'}
-                      </span>
-                    </div>
-                  );
-                } else {
-                  // Text block
-                  return (
-                    <div key={block.id} className="prose prose-invert max-w-none">
-                      <ReactMarkdown
-                        remarkPlugins={[remarkGfm]}
-                        components={markdownComponents}
-                      >
-                        {block.content || ''}
-                      </ReactMarkdown>
-                    </div>
-                  );
-                }
-              })}
-
-              {/* Loading state - starting to think, no blocks yet */}
-              {isThinking && streamingBlocks.length === 0 && (
-                <div className="flex items-center gap-3 text-blue-200/60">
-                  <svg className="w-5 h-5 animate-spin text-sky-400" fill="none" viewBox="0 0 24 24">
-                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-                  </svg>
-                  <span>Starting to think...</span>
-                </div>
-              )}
-            </div>
-          )}
-
-
-          {/* Initial loading indicator */}
-          {isLoading && !isStreaming && !isThinking && streamingBlocks.length === 0 && (
-            <div className="flex items-center gap-3 text-blue-200/60">
-              <svg className="w-5 h-5 animate-spin text-sky-400" fill="none" viewBox="0 0 24 24">
-                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-              </svg>
-              <span>Preparing synthesis...</span>
-            </div>
-          )}
-
-          <div ref={messagesEndRef} />
-        </div>
+            <div ref={messagesEndRef} />
+          </div>
         </div>
 
         {/* Floating Panel - inside messages area */}
@@ -1397,101 +1738,86 @@ export function IdeaChat({ ideaId, conversationId, isNewConversation, onBack }: 
           onClose={() => setPanelOpen(false)}
           activeTab={activePanelTab}
           onTabChange={setActivePanelTab}
-          appFiles={appFiles}
-          appEntryFile={appEntryFile}
-          appLoading={appLoading}
           dependencyNodes={dependencyNodes}
           dependencyConnections={dependencyConnections}
           dependencyNodesLoading={dependencyNodesLoading}
           onNodePositionChange={handleNodePositionChange}
           ideaId={ideaId}
-          conversationId={conversationId}
+          activeBranchId={activeBranchId}
+          conversationId={effectiveConversationId}
           streamingTokens={{
             input: liveStreamingTokens.input,
             output: liveStreamingTokens.output,
             isStreaming: isStreaming
           }}
+          viewingSnapshot={viewingSnapshotData ? {
+            versionNumber: viewingSnapshotData.versionNumber,
+            synthesisContent: viewingSnapshotData.synthesisContent,
+            nodes: viewingSnapshotData.nodes,
+            connections: viewingSnapshotData.connections
+          } : undefined}
+          onBackToLive={handleBackToLive}
+          onRestoreSnapshot={viewingSnapshotId ? () => handleRestoreSnapshot(viewingSnapshotId) : undefined}
+          previewRefreshKey={previewRefreshKey}
         />
       </div>
 
-      {/* Input area */}
-      <div className="border-t border-[#1e3a5f] px-6 py-4">
-        <div className={`mx-auto flex items-end gap-4 transition-all duration-300 ease-in-out ${
-          panelOpen ? 'max-w-2xl' : 'max-w-4xl'
-        }`}>
-          <textarea
-            ref={inputRef}
-            value={inputValue}
-            onChange={(e) => setInputValue(e.target.value)}
-            onKeyDown={handleKeyPress}
-            placeholder="Ask a follow-up question or request changes..."
-            disabled={isLoading || isStreaming}
-            rows={1}
-            className="flex-1 bg-[#112240] border border-[#1e3a5f] rounded-xl px-4 py-3
-                       text-blue-100 placeholder-blue-300/40
-                       focus:outline-none focus:border-sky-500
-                       disabled:opacity-50 disabled:cursor-not-allowed
-                       resize-none"
-            style={{ minHeight: '48px', maxHeight: '120px' }}
-          />
-          {/* Voice input button */}
-          <button
-            onClick={isRecording ? stopRecording : () => startRecording()}
-            disabled={isLoading || isStreaming || isProcessingAudio}
-            className={`p-3 rounded-xl transition-colors
-                       ${isRecording
-                         ? 'bg-red-500 text-white animate-pulse'
-                         : isProcessingAudio
-                           ? 'bg-amber-500 text-white'
-                           : 'bg-[#1e3a5f] text-blue-300 hover:bg-[#2a4a6f] hover:text-sky-400'
-                       }
-                       disabled:opacity-50 disabled:cursor-not-allowed`}
-            title={isRecording ? 'Stop recording' : isProcessingAudio ? 'Processing...' : 'Voice input'}
-          >
-            {isProcessingAudio ? (
-              <svg className="w-5 h-5 animate-spin" fill="none" viewBox="0 0 24 24">
-                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-              </svg>
-            ) : isRecording ? (
-              <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
-                <rect x="6" y="6" width="12" height="12" rx="2" />
-              </svg>
-            ) : (
-              <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
-                <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z" />
-                <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z" />
-              </svg>
+      {/* Input area - extracted component with local state */}
+      <ChatInput
+        onSend={handleSend}
+        onStop={handleStop}
+        isLoading={isLoading}
+        isStreaming={isStreaming}
+        isRecording={isRecording}
+        isProcessingAudio={isProcessingAudio}
+        onStartRecording={startRecording}
+        onStopRecording={stopRecording}
+        panelOpen={panelOpen}
+        pendingTranscription={pendingTranscription}
+        onTranscriptionConsumed={handleTranscriptionConsumed}
+      />
+
+      {/* Voice Agent floating overlay */}
+      {(isVoiceAgentRecording || isVoiceAgentRunning || voiceAgentResponse) && (
+        <div className="fixed bottom-24 right-6 z-50 max-w-xs">
+          <div className="bg-[#1a2744] border border-[#2a4a7f] rounded-lg px-4 py-3 shadow-xl">
+            {isVoiceAgentRecording && (
+              <div className="flex items-center gap-2 text-red-400 text-sm">
+                <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />
+                Listening... say your command, then &quot;Alexa&quot; to send
+              </div>
             )}
-          </button>
-          {/* Stop button - shown when streaming/loading */}
-          {(isStreaming || isLoading) ? (
-            <button
-              onClick={handleStop}
-              className="p-3 rounded-xl bg-red-500 text-white
-                         hover:bg-red-400 transition-colors"
-              title="Stop generation"
-            >
-              <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
-                <rect x="6" y="6" width="12" height="12" rx="2" />
-              </svg>
-            </button>
-          ) : (
-            <button
-              onClick={handleSend}
-              disabled={!inputValue.trim()}
-              className="p-3 rounded-xl bg-sky-500 text-white
-                         hover:bg-sky-400 transition-colors
-                         disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-                      d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" />
-              </svg>
-            </button>
-          )}
+            {isVoiceAgentRunning && !voiceAgentResponse && (
+              <div className="flex items-center gap-2 text-blue-400 text-sm">
+                <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                </svg>
+                Voice Agent working...
+              </div>
+            )}
+            {voiceAgentResponse && (
+              <div className="text-[#c5d5e8] text-sm leading-relaxed">
+                {voiceAgentResponse}
+              </div>
+            )}
+          </div>
         </div>
-      </div>
+      )}
+
+      {/* Conversation Tree overlay */}
+      {showTree && (
+        <ConversationTree
+          ideaId={ideaId}
+          branches={branches}
+          activeBranchId={activeBranchId}
+          onSwitchBranch={handleSwitchBranch}
+          onCreateChild={handleCreateChild}
+          onDeleteBranch={handleDeleteBranch}
+          onClose={() => setShowTree(false)}
+          isCreatingBranch={isCreatingBranch}
+        />
+      )}
     </div>
   );
 }

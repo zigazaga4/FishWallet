@@ -1,4 +1,4 @@
-import { eq, desc, asc } from 'drizzle-orm';
+import { eq, desc, asc, count, sql } from 'drizzle-orm';
 import { getDatabase, schema } from '../db';
 import { Conversation, NewConversation, Message, NewMessage } from '../db/schema';
 import { randomUUID } from 'crypto';
@@ -26,7 +26,7 @@ export class DatabaseService {
       id: this.generateId(),
       title: data.title,
       systemPrompt: data.systemPrompt,
-      model: data.model || 'claude-sonnet-4-5-20250929',
+      model: data.model || 'claude-opus-4-5-20251101',
       createdAt: now,
       updatedAt: now,
       totalInputTokens: 0,
@@ -74,6 +74,24 @@ export class DatabaseService {
   deleteConversation(id: string): void {
     const db = getDatabase();
     db.delete(schema.conversations).where(eq(schema.conversations.id, id)).run();
+  }
+
+  // Update the Claude Code session ID for a conversation
+  updateConversationSessionId(id: string, sessionId: string): void {
+    const db = getDatabase();
+    db.update(schema.conversations)
+      .set({
+        claudeSessionId: sessionId,
+        updatedAt: this.now()
+      })
+      .where(eq(schema.conversations.id, id))
+      .run();
+  }
+
+  // Get the Claude Code session ID for a conversation
+  getConversationSessionId(id: string): string | null {
+    const conversation = this.getConversation(id);
+    return conversation?.claudeSessionId ?? null;
   }
 
   // Update conversation token counts
@@ -150,13 +168,33 @@ export class DatabaseService {
   }
 
   // Get all messages for a conversation ordered by creation date
+  // Uses rowid as secondary sort to preserve insertion order for same-second timestamps
   getMessages(conversationId: string): Message[] {
     const db = getDatabase();
     return db.select()
       .from(schema.messages)
       .where(eq(schema.messages.conversationId, conversationId))
-      .orderBy(asc(schema.messages.createdAt))
+      .orderBy(asc(schema.messages.createdAt), asc(sql`rowid`))
       .all();
+  }
+
+  // Get message count for a conversation
+  getMessageCount(conversationId: string): number {
+    const db = getDatabase();
+    const result = db.select({ value: count() })
+      .from(schema.messages)
+      .where(eq(schema.messages.conversationId, conversationId))
+      .get();
+    return result?.value ?? 0;
+  }
+
+  // Update the contentBlocks JSON for a message (e.g. after tool results arrive)
+  updateMessageContentBlocks(id: string, contentBlocks: unknown[]): void {
+    const db = getDatabase();
+    db.update(schema.messages)
+      .set({ contentBlocks: JSON.stringify(contentBlocks) })
+      .where(eq(schema.messages.id, id))
+      .run();
   }
 
   // Delete a message

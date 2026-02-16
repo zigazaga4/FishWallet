@@ -62,7 +62,7 @@ function createTables(): void {
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL,
       system_prompt TEXT,
-      model TEXT NOT NULL DEFAULT 'claude-sonnet-4-5-20250929',
+      model TEXT NOT NULL DEFAULT 'claude-opus-4-5-20251101',
       total_input_tokens INTEGER NOT NULL DEFAULT 0,
       total_output_tokens INTEGER NOT NULL DEFAULT 0
     )
@@ -226,6 +226,89 @@ function createTables(): void {
   } catch {
     // Column already exists, ignore error
   }
+
+  // Create idea_snapshots table for versioned snapshots
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS idea_snapshots (
+      id TEXT PRIMARY KEY,
+      idea_id TEXT NOT NULL,
+      version_number INTEGER NOT NULL,
+      synthesis_content TEXT,
+      files_snapshot TEXT NOT NULL,
+      nodes_snapshot TEXT NOT NULL,
+      connections_snapshot TEXT NOT NULL,
+      tools_used TEXT,
+      created_at INTEGER NOT NULL,
+      FOREIGN KEY (idea_id) REFERENCES ideas(id) ON DELETE CASCADE
+    )
+  `);
+
+  // Create indexes for idea_snapshots
+  sqlite.exec(`
+    CREATE INDEX IF NOT EXISTS idx_idea_snapshots_idea_id ON idea_snapshots(idea_id);
+    CREATE INDEX IF NOT EXISTS idx_idea_snapshots_version ON idea_snapshots(idea_id, version_number);
+  `);
+
+  // Create conversation_branches table for git-like branching
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS conversation_branches (
+      id TEXT PRIMARY KEY,
+      idea_id TEXT NOT NULL,
+      parent_branch_id TEXT,
+      conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
+      label TEXT NOT NULL DEFAULT 'Branch',
+      depth INTEGER NOT NULL DEFAULT 0,
+      synthesis_content TEXT,
+      files_snapshot TEXT NOT NULL DEFAULT '[]',
+      nodes_snapshot TEXT NOT NULL DEFAULT '[]',
+      connections_snapshot TEXT NOT NULL DEFAULT '[]',
+      compaction_cache TEXT,
+      compaction_message_count INTEGER,
+      is_active INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      FOREIGN KEY (idea_id) REFERENCES ideas(id) ON DELETE CASCADE,
+      FOREIGN KEY (parent_branch_id) REFERENCES conversation_branches(id) ON DELETE SET NULL
+    )
+  `);
+
+  // Migration: add compaction cache columns if missing
+  const branchCols = sqlite.pragma('table_info(conversation_branches)') as Array<{ name: string }>;
+  const branchColNames = branchCols.map(c => c.name);
+  if (!branchColNames.includes('compaction_cache')) {
+    sqlite.exec(`ALTER TABLE conversation_branches ADD COLUMN compaction_cache TEXT`);
+  }
+  if (!branchColNames.includes('compaction_message_count')) {
+    sqlite.exec(`ALTER TABLE conversation_branches ADD COLUMN compaction_message_count INTEGER`);
+  }
+
+  // Migration: Add claude_session_id to conversations for Agent SDK session resumption
+  try {
+    sqlite.exec(`ALTER TABLE conversations ADD COLUMN claude_session_id TEXT`);
+  } catch {
+    // Column already exists, ignore error
+  }
+
+  // Migration: Add project_path column to ideas for Vite project folders
+  try {
+    sqlite.exec(`ALTER TABLE ideas ADD COLUMN project_path TEXT`);
+  } catch {
+    // Column already exists, ignore error
+  }
+
+  // Migration: Add folder_name column to conversation_branches for disk-based branching
+  try {
+    sqlite.exec(`ALTER TABLE conversation_branches ADD COLUMN folder_name TEXT`);
+  } catch {
+    // Column already exists, ignore error
+  }
+
+  // Create indexes for conversation_branches
+  sqlite.exec(`
+    CREATE INDEX IF NOT EXISTS idx_conv_branches_idea ON conversation_branches(idea_id);
+    CREATE INDEX IF NOT EXISTS idx_conv_branches_parent ON conversation_branches(parent_branch_id);
+    CREATE INDEX IF NOT EXISTS idx_conv_branches_active ON conversation_branches(idea_id, is_active);
+  `);
 }
 
 // Get the database instance

@@ -24,6 +24,17 @@ function setupPermissionHandlers(): void {
     const allowedPermissions = ['media', 'microphone', 'camera', 'audioCapture'];
     return allowedPermissions.includes(permission);
   });
+
+  // Strip COEP/COOP headers from all responses so cross-origin iframes
+  // (app preview at localhost:5174+) are not blocked by ERR_BLOCKED_BY_RESPONSE.
+  ses.webRequest.onHeadersReceived((details, callback) => {
+    const headers = { ...details.responseHeaders };
+    delete headers['cross-origin-embedder-policy'];
+    delete headers['Cross-Origin-Embedder-Policy'];
+    delete headers['cross-origin-opener-policy'];
+    delete headers['Cross-Origin-Opener-Policy'];
+    callback({ responseHeaders: headers });
+  });
 }
 
 // Request microphone access on Windows/macOS

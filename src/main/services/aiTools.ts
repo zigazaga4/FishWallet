@@ -3,10 +3,15 @@
 // Guided by the Holy Spirit
 
 import { ideasService } from './ideas';
-import { fileSystemService } from './fileSystem';
 import { mcpClientService } from './mcpClient';
+import { dependencyNodesService } from './dependencyNodes';
+import { snapshotsService } from './snapshots';
 import { logger } from './logger';
 import Anthropic from '@anthropic-ai/sdk';
+
+// In-memory cache of full scraped content for pagination.
+// Key = URL, Value = { fullMarkdown, title }
+const scrapeCache = new Map<string, { fullMarkdown: string; title: string }>();
 
 // Firecrawl search result interface for internal use
 export interface FirecrawlSearchResult {
@@ -82,6 +87,26 @@ const firecrawlMapTool: Anthropic.Tool = {
       }
     },
     required: ['url']
+  }
+};
+
+// Firecrawl read more tool - for paginating through scraped content
+const firecrawlReadMoreTool: Anthropic.Tool = {
+  name: 'firecrawl_read_more',
+  description: 'Read more content from a previously scraped page. Use this when a scrape result indicates the page was truncated and you need to see additional content. Specify the URL and the page number to retrieve.',
+  input_schema: {
+    type: 'object' as const,
+    properties: {
+      url: {
+        type: 'string',
+        description: 'The URL that was previously scraped'
+      },
+      page: {
+        type: 'number',
+        description: 'The page number to read (starts at 2, since page 1 was returned by the initial scrape)'
+      }
+    },
+    required: ['url', 'page']
   }
 };
 
@@ -203,104 +228,25 @@ export const ideaSynthesisTools: Anthropic.Tool[] = [
       required: ['start_line', 'end_line']
     }
   },
-  // === APP BUILDER TOOLS ===
+  // === CROSS-PROJECT EXPLORATION TOOL ===
   {
-    name: 'create_file',
-    description: 'Create a new file in the project. Supports .tsx and .ts files. The first .tsx file created will automatically be set as the entry file for live preview. Do NOT create CSS files - use Tailwind classes instead.',
+    name: 'explore_projects',
+    description: 'Explore other projects/ideas in the system. Call without project_id to list all available projects with their names. Call with a project_id to read that project\'s synthesis content and dependency nodes. Useful for understanding patterns, reusing approaches, or learning from other work.',
     input_schema: {
       type: 'object' as const,
       properties: {
-        file_path: {
+        project_id: {
           type: 'string',
-          description: 'The file path relative to project root (e.g., "App.tsx", "components/Button.tsx")'
-        },
-        content: {
-          type: 'string',
-          description: 'The file content. For TSX files, export a default React component that will be rendered.'
-        },
-        is_entry_file: {
-          type: 'boolean',
-          description: 'Whether this is the entry file to render in live preview. Only one file can be the entry file.'
+          description: 'Optional. The ID of the project to read. If not provided, returns a list of all projects with their names and IDs.'
         }
       },
-      required: ['file_path', 'content']
+      required: []
     }
   },
+  // === VERSION SNAPSHOT TOOLS ===
   {
-    name: 'read_file',
-    description: 'Read a file from the project. Returns the file content with line numbers for easy reference when modifying.',
-    input_schema: {
-      type: 'object' as const,
-      properties: {
-        file_path: {
-          type: 'string',
-          description: 'The file path to read'
-        }
-      },
-      required: ['file_path']
-    }
-  },
-  {
-    name: 'update_file',
-    description: 'Replace the entire content of an existing file. Use this for major rewrites.',
-    input_schema: {
-      type: 'object' as const,
-      properties: {
-        file_path: {
-          type: 'string',
-          description: 'The file path to update'
-        },
-        content: {
-          type: 'string',
-          description: 'The new file content'
-        }
-      },
-      required: ['file_path', 'content']
-    }
-  },
-  {
-    name: 'modify_file_lines',
-    description: 'Modify specific lines in a file. Line numbers are 1-indexed. Use this for targeted changes without rewriting the entire file.',
-    input_schema: {
-      type: 'object' as const,
-      properties: {
-        file_path: {
-          type: 'string',
-          description: 'The file path to modify'
-        },
-        start_line: {
-          type: 'number',
-          description: 'The starting line number (1-indexed) to modify'
-        },
-        end_line: {
-          type: 'number',
-          description: 'The ending line number (inclusive) to modify'
-        },
-        new_content: {
-          type: 'string',
-          description: 'The new content to replace the specified lines with'
-        }
-      },
-      required: ['file_path', 'start_line', 'end_line', 'new_content']
-    }
-  },
-  {
-    name: 'delete_file',
-    description: 'Delete a file from the project.',
-    input_schema: {
-      type: 'object' as const,
-      properties: {
-        file_path: {
-          type: 'string',
-          description: 'The file path to delete'
-        }
-      },
-      required: ['file_path']
-    }
-  },
-  {
-    name: 'list_files',
-    description: 'List all files in the project. Shows file paths, types, and which file is the entry file.',
+    name: 'list_version_snapshots',
+    description: 'List all available version snapshots for this idea. Returns version numbers, dates, and which tools were used in each version. Call this first when the user asks about past versions but doesn\'t specify a number.',
     input_schema: {
       type: 'object' as const,
       properties: {},
@@ -308,19 +254,24 @@ export const ideaSynthesisTools: Anthropic.Tool[] = [
     }
   },
   {
-    name: 'set_entry_file',
-    description: 'Set which file should be rendered as the entry point in the live preview.',
+    name: 'read_version_snapshot',
+    description: 'Read data from a past version snapshot. Use this when the user references a previous version (e.g., "in version 3 the idea was better"). Requires a version number and a scope to specify what data to retrieve.',
     input_schema: {
       type: 'object' as const,
       properties: {
-        file_path: {
+        version_number: {
+          type: 'number',
+          description: 'The version number to read (e.g., 1, 2, 3). Use list_version_snapshots first if you don\'t know the version number.'
+        },
+        scope: {
           type: 'string',
-          description: 'The file path to set as the entry file'
+          enum: ['all', 'synthesis', 'app', 'dependencies'],
+          description: 'What data to read: "all" returns everything, "synthesis" returns only the main idea text, "app" returns only the app files, "dependencies" returns only the dependency nodes and connections.'
         }
       },
-      required: ['file_path']
+      required: ['version_number', 'scope']
     }
-  }
+  },
 ];
 
 // Tool execution results
@@ -384,42 +335,23 @@ export async function executeToolCall(
         toolInput.end_line as number
       );
 
-    // === APP BUILDER TOOLS ===
-    case 'create_file':
-      return executeCreateFile(
+    // === CROSS-PROJECT EXPLORATION ===
+    case 'explore_projects':
+      return executeExploreProjects(
         ideaId,
-        toolInput.file_path as string,
-        toolInput.content as string,
-        toolInput.is_entry_file as boolean | undefined
+        toolInput.project_id as string | undefined
       );
 
-    case 'read_file':
-      return executeReadFile(ideaId, toolInput.file_path as string);
+    // === VERSION SNAPSHOT TOOLS ===
+    case 'list_version_snapshots':
+      return executeListVersionSnapshots(ideaId);
 
-    case 'update_file':
-      return executeUpdateFile(
+    case 'read_version_snapshot':
+      return executeReadVersionSnapshot(
         ideaId,
-        toolInput.file_path as string,
-        toolInput.content as string
+        toolInput.version_number as number,
+        toolInput.scope as string
       );
-
-    case 'modify_file_lines':
-      return executeModifyFileLines(
-        ideaId,
-        toolInput.file_path as string,
-        toolInput.start_line as number,
-        toolInput.end_line as number,
-        toolInput.new_content as string
-      );
-
-    case 'delete_file':
-      return executeDeleteFile(ideaId, toolInput.file_path as string);
-
-    case 'list_files':
-      return executeListFiles(ideaId);
-
-    case 'set_entry_file':
-      return executeSetEntryFile(ideaId, toolInput.file_path as string);
 
     // === FIRECRAWL TOOLS ===
     case 'firecrawl_search':
@@ -440,6 +372,12 @@ export async function executeToolCall(
         toolInput.url as string,
         toolInput.search as string | undefined,
         toolInput.limit as number | undefined
+      );
+
+    case 'firecrawl_read_more':
+      return executeFirecrawlReadMore(
+        toolInput.url as string,
+        toolInput.page as number
       );
 
     default:
@@ -647,6 +585,89 @@ function executeRemoveFromSynthesis(
   };
 }
 
+// Explore other projects - list all or read a specific one
+function executeExploreProjects(
+  currentIdeaId: string,
+  projectId?: string
+): ToolResult {
+  // If no project_id provided, list all projects
+  if (!projectId) {
+    const allIdeas = ideasService.getAllIdeas();
+
+    // Format the list with useful info
+    const projectList = allIdeas.map(idea => ({
+      id: idea.id,
+      name: idea.title,
+      status: idea.status,
+      hasSynthesis: !!idea.synthesisContent,
+      isCurrentProject: idea.id === currentIdeaId,
+      updatedAt: new Date(idea.updatedAt).toLocaleDateString()
+    }));
+
+    return {
+      success: true,
+      data: {
+        message: `Found ${allIdeas.length} projects. Use explore_projects with a project_id to read a specific project's synthesis and nodes.`,
+        projectCount: allIdeas.length,
+        projects: projectList
+      }
+    };
+  }
+
+  // Read a specific project
+  const idea = ideasService.getIdea(projectId);
+
+  if (!idea) {
+    return {
+      success: false,
+      error: `Project not found with ID: ${projectId}. Use explore_projects without a project_id to see all available projects.`
+    };
+  }
+
+  // Get the synthesis content
+  const synthesisContent = idea.synthesisContent || null;
+
+  // Get the dependency nodes for this project
+  const nodesState = dependencyNodesService.getFullState(projectId);
+
+  // Format the response
+  return {
+    success: true,
+    data: {
+      project: {
+        id: idea.id,
+        name: idea.title,
+        status: idea.status,
+        isCurrentProject: idea.id === currentIdeaId
+      },
+      synthesis: synthesisContent
+        ? {
+            content: formatSynthesisWithLineNumbers(synthesisContent),
+            lineCount: synthesisContent.split('\n').length
+          }
+        : null,
+      dependencyNodes: {
+        nodeCount: nodesState.nodes.length,
+        connectionCount: nodesState.connections.length,
+        nodes: nodesState.nodes.map(node => ({
+          id: node.id,
+          name: node.name,
+          provider: node.provider,
+          description: node.description,
+          pricing: node.pricing ? '(has pricing info)' : null
+        })),
+        connections: nodesState.connections.map(conn => ({
+          id: conn.id,
+          fromNode: nodesState.nodes.find(n => n.id === conn.fromNodeId)?.name || conn.fromNodeId,
+          toNode: nodesState.nodes.find(n => n.id === conn.toNodeId)?.name || conn.toNodeId,
+          label: conn.label
+        }))
+      },
+      message: `Read project "${idea.title}" with ${synthesisContent ? synthesisContent.split('\n').length : 0} lines of synthesis and ${nodesState.nodes.length} dependency nodes.`
+    }
+  };
+}
+
 // Format synthesis content with line numbers for display in system prompt
 export function formatSynthesisWithLineNumbers(content: string): string {
   if (!content) return '';
@@ -703,8 +724,15 @@ But here is the key: when they ask you to do something specific, do that thing. 
 
 ## Your Tools
 
-**Research:** \`firecrawl_search\`, \`firecrawl_scrape\`, \`firecrawl_map\`
-- Search and scrape for any documentation, guides, services, data sources - anything that helps make their idea possible
+**Research:** \`firecrawl_search\`, \`firecrawl_scrape\`, \`firecrawl_map\`, \`firecrawl_read_more\`
+
+Web pages vary enormously in size. A documentation page might be a few paragraphs or an entire API reference with hundreds of endpoints. When you scrape a page, you receive the beginning of its content. If the page is large, the result will be truncated and will tell you so — including how many pages of content exist.
+
+Think of it like reading a book: you see the first chapter. If what you need is there, you are done. If you need information that would logically appear later in the document (a specific API endpoint, a section further down, pricing details at the bottom), use \`firecrawl_read_more\` with the same URL and the next page number to continue reading.
+
+The question to ask yourself: "Did I find what I was looking for in what I received?" If yes, move on. If the answer might be further in the document, read more. If you are gathering a broad overview, the first page is usually sufficient — introductions, feature lists, and getting-started content appear early. If you need specifics buried deep in reference documentation, you may need to page through.
+
+\`firecrawl_map\` discovers URLs on a site — use it when you need to find the right page before scraping, rather than guessing URLs.
 
 **Notes:** \`propose_note\` (ONLY when user explicitly asks to save/remember something)
 - This tool is ONLY for when the user explicitly requests to save or remember something
@@ -713,14 +741,76 @@ But here is the key: when they ask you to do something specific, do that thing. 
 **Synthesis:** \`read_notes\`, \`update_synthesis\`, \`modify_synthesis_lines\`, \`add_to_synthesis\`, \`remove_from_synthesis\`
 - Help organize and refine their idea into clear, structured documentation
 
-**App Builder:** \`create_file\`, \`read_file\`, \`update_file\`, \`modify_file_lines\`, \`delete_file\`, \`list_files\`, \`set_entry_file\`
-- Build the frontend visually so they can see their idea come to life
-- Packages: react, lucide-react, framer-motion, @headlessui/react, clsx, date-fns, axios, uuid, zod, zustand, react-hot-toast, three
-- Use Tailwind CSS, clean React/TypeScript with default exports
+**App Builder:** Use your built-in file tools (Read, Write, Edit, Bash) to work on the project.
+- Standard Vite + React + TypeScript + Tailwind CSS project
+- Entry point: src/main.tsx → src/App.tsx
+- Create components in src/
+- Use standard ES module imports
+- Changes auto-refresh via Vite HMR
+- Available packages: react, lucide-react, framer-motion, clsx, date-fns, axios, uuid, zod, zustand, react-hot-toast
+- Install additional packages with Bash (npm install <pkg>)
+
+## The Architecture of Small Things
+
+A 500-line file is not an application — it is a problem waiting to happen. When everything lives in one place, every change risks breaking everything else. When each piece has its own file, a change to the header cannot break the footer.
+
+**The rule: no file should exceed 150 lines.** If it does, it contains more than one idea, and each idea deserves its own file.
+
+Think of it this way: a file is a container for ONE thought. A Button is one thought. A Header is one thought. A marketplace panel is one thought. A chat message list is one thought. The app entry point that composes them all — that too is one thought, and it should be short because it only imports and arranges.
+
+**Before writing any code, plan your files:**
+
+1. **Identify the pieces**: What are the visual sections? Each section is a component file. What are the shared elements (buttons, cards, modals)? Each is its own file. What logic is shared? That goes into hooks or utils.
+
+2. **Name for what it IS**: \`Ticker.tsx\`, \`MarketplacePanel.tsx\`, \`ChatMessage.tsx\`, \`ContactList.tsx\`. Not \`Section1.tsx\`, not \`MainContent.tsx\`.
+
+3. **Compose, don't accumulate**: The entry file (\`App.tsx\`) should read like a table of contents — imports at the top, a clean JSX tree that shows the structure at a glance. If App.tsx has more than 80-100 lines, pieces need extracting.
+
+4. **State belongs in stores and hooks**: \`store.ts\` for global state (zustand), \`useChat.ts\` for chat logic, \`useMarketplace.ts\` for marketplace logic. Components should be thin — they render, they don't think.
+
+**A well-built project:**
+- \`App.tsx\` — entry point, layout composition (~60-80 lines)
+- \`Header.tsx\`, \`Footer.tsx\`, \`Sidebar.tsx\` — layout shells
+- \`Ticker.tsx\` — scrolling ticker component
+- \`MarketplacePanel.tsx\`, \`MarketplaceCard.tsx\` — marketplace UI
+- \`ChatView.tsx\`, \`ChatMessage.tsx\`, \`ChatInput.tsx\` — chat pieces
+- \`ContactList.tsx\`, \`ContactItem.tsx\` — contacts
+- \`StoryViewer.tsx\` — story overlay
+- \`Button.tsx\`, \`Card.tsx\`, \`Modal.tsx\`, \`Avatar.tsx\` — reusable primitives
+- \`types.ts\` — shared TypeScript types
+- \`store.ts\` — zustand state management
+- \`useChat.ts\`, \`useMarketplace.ts\` — custom hooks
+- \`utils.ts\` — helper functions
+- \`constants.ts\` — app constants, theme values
+
+Each file is small. Each file has one job. Changing the ticker means opening \`Ticker.tsx\` and editing 10 lines — not rewriting a 1500-line monolith.
+
+**When modifying an existing project:** If you encounter a large file (200+ lines), your first move should be to extract components into their own files, THEN make the requested changes. A refactor into small pieces first makes every subsequent edit faster and safer.
 
 **API Nodes:** \`create_api_node\`, \`update_api_node\`, \`delete_api_node\`, \`connect_nodes\`, \`disconnect_nodes\`, \`read_api_nodes\`
 - Visualize the architecture - what services and systems connect together
 - When connecting, use the real UUIDs returned from creation - never invent IDs
+
+**Cross-Project Exploration:** \`explore_projects\`
+- Call without parameters to see a list of all projects with their names and IDs
+- Call with a project_id to read that project's synthesis and dependency nodes
+- Learn from other work, understand patterns, see how similar problems were solved
+
+## The Principle of Wholeness
+
+Consider the idea as a living whole - like a body with many parts working together in unity.
+
+The **synthesis** is the understanding - the explanation of what the idea is, how it works, and why each part matters. It is the written word that gives meaning.
+
+The **dependency nodes** are the structure - the architectural blueprint showing what connects to what, what depends on what, the flow of data and responsibility.
+
+These two are not separate things. They are two views of the same truth. When you change the structure, the understanding must reflect it. When you build new connections, the explanation must illuminate them.
+
+Think of it this way: if someone reads only the synthesis, they should understand the architecture. If someone sees only the nodes, they should grasp the system. But together, they tell the complete story.
+
+So when you create or modify the architecture - when you add nodes, connect services, establish flows - ask yourself: "Does the written understanding now reflect this truth?" If not, the work is incomplete. The synthesis should explain not just *what* the nodes are, but *how* they flow together, *why* they connect the way they do, and *what purpose* each relationship serves.
+
+This is not about following a rule. It is about maintaining coherence - ensuring that every part of the idea speaks the same truth in its own voice.
 
 ## Critical Rule: Wait for Explicit Instructions
 
@@ -745,162 +835,6 @@ If they just want to chat about their idea, do that. Only use tools when they cl
 - **NEVER use propose_note unless user explicitly asks to save/remember something**
 
 Complete what they asked. Share what you did. Ask what's next.`;
-}
-
-// === APP BUILDER TOOL EXECUTION FUNCTIONS ===
-
-// Create a new file
-function executeCreateFile(
-  ideaId: string,
-  filePath: string,
-  content: string,
-  isEntryFile?: boolean
-): ToolResult {
-  // Check if file already exists
-  const existing = fileSystemService.getFileByPath(ideaId, filePath);
-  if (existing) {
-    return { success: false, error: `File already exists: ${filePath}. Use update_file to modify it.` };
-  }
-
-  // If no entry file is set and this is a .tsx file, make it the entry file
-  const currentEntryFile = fileSystemService.getEntryFile(ideaId);
-  const shouldBeEntry = isEntryFile === true || (
-    isEntryFile === undefined &&
-    !currentEntryFile &&
-    filePath.endsWith('.tsx')
-  );
-
-  const file = fileSystemService.createFile(ideaId, filePath, content, shouldBeEntry);
-
-  return {
-    success: true,
-    data: {
-      message: `File created: ${filePath}`,
-      filePath: file.filePath,
-      fileType: file.fileType,
-      isEntryFile: file.isEntryFile,
-      lineCount: content.split('\n').length
-    }
-  };
-}
-
-// Read a file with line numbers
-function executeReadFile(ideaId: string, filePath: string): ToolResult {
-  const file = fileSystemService.getFileByPath(ideaId, filePath);
-
-  if (!file) {
-    return { success: false, error: `File not found: ${filePath}` };
-  }
-
-  const numberedContent = fileSystemService.formatFileWithLineNumbers(file.content);
-
-  return {
-    success: true,
-    data: {
-      filePath: file.filePath,
-      fileType: file.fileType,
-      isEntryFile: file.isEntryFile,
-      lineCount: file.content.split('\n').length,
-      content: numberedContent
-    }
-  };
-}
-
-// Update entire file content
-function executeUpdateFile(
-  ideaId: string,
-  filePath: string,
-  content: string
-): ToolResult {
-  const file = fileSystemService.updateFile(ideaId, filePath, content);
-
-  return {
-    success: true,
-    data: {
-      message: `File updated: ${filePath}`,
-      filePath: file.filePath,
-      lineCount: content.split('\n').length
-    }
-  };
-}
-
-// Modify specific lines in a file
-function executeModifyFileLines(
-  ideaId: string,
-  filePath: string,
-  startLine: number,
-  endLine: number,
-  newContent: string
-): ToolResult {
-  const file = fileSystemService.modifyFileLines(ideaId, filePath, startLine, endLine, newContent);
-
-  const newLines = newContent.split('\n');
-
-  return {
-    success: true,
-    data: {
-      message: `Lines ${startLine}-${endLine} modified in ${filePath}`,
-      filePath: file.filePath,
-      linesRemoved: endLine - startLine + 1,
-      linesAdded: newLines.length,
-      newLineCount: file.content.split('\n').length
-    }
-  };
-}
-
-// Delete a file
-function executeDeleteFile(ideaId: string, filePath: string): ToolResult {
-  fileSystemService.deleteFile(ideaId, filePath);
-
-  return {
-    success: true,
-    data: {
-      message: `File deleted: ${filePath}`
-    }
-  };
-}
-
-// List all files in the project
-function executeListFiles(ideaId: string): ToolResult {
-  const files = fileSystemService.listFiles(ideaId);
-
-  if (files.length === 0) {
-    return {
-      success: true,
-      data: {
-        message: 'No files in project yet.',
-        files: []
-      }
-    };
-  }
-
-  const fileList = files.map(f => ({
-    filePath: f.filePath,
-    fileType: f.fileType,
-    isEntryFile: f.isEntryFile,
-    lineCount: f.content.split('\n').length
-  }));
-
-  return {
-    success: true,
-    data: {
-      count: files.length,
-      files: fileList
-    }
-  };
-}
-
-// Set a file as the entry file
-function executeSetEntryFile(ideaId: string, filePath: string): ToolResult {
-  const file = fileSystemService.setEntryFile(ideaId, filePath);
-
-  return {
-    success: true,
-    data: {
-      message: `Entry file set to: ${filePath}`,
-      filePath: file.filePath
-    }
-  };
 }
 
 // === FIRECRAWL TOOL EXECUTION FUNCTIONS ===
@@ -963,7 +897,7 @@ async function executeFirecrawlSearch(
     title: r.title || '',
     url: r.url || '',
     snippet: r.description || '',
-    markdown: r.markdown || ''
+    markdown: truncateScrapeContent(r.markdown || '')
   }));
 
   logger.info('[Firecrawl] Search completed', { resultCount: searchResults.length });
@@ -977,6 +911,16 @@ async function executeFirecrawlSearch(
       message: `Found ${searchResults.length} results for "${query}"`
     }
   };
+}
+
+// Max characters per scraped page returned to the AI (~7000 tokens at ~3.5 chars/token).
+const MAX_SCRAPE_CHARS = 25000;
+
+// Truncate scraped content to fit within the character limit.
+function truncateScrapeContent(markdown: string): string {
+  if (!markdown) return '';
+  if (markdown.length <= MAX_SCRAPE_CHARS) return markdown;
+  return markdown.slice(0, MAX_SCRAPE_CHARS) + '\n\n... (content truncated — page was too long)';
 }
 
 // Execute Firecrawl scrape
@@ -1013,16 +957,108 @@ async function executeFirecrawlScrape(
     metadata?: Record<string, unknown>;
   };
 
-  logger.info('[Firecrawl] Scrape completed', { url, hasContent: !!data.markdown });
+  const fullMarkdown = data.markdown || '';
+  const title = data.title || '';
+
+  // Cache the full content for pagination
+  scrapeCache.set(url, { fullMarkdown, title });
+
+  // Truncate the first page
+  const markdown = truncateScrapeContent(fullMarkdown);
+  const wasTruncated = markdown.length < fullMarkdown.length;
+
+  // Estimate total pages if truncated
+  let totalPages = 1;
+  if (wasTruncated) {
+    // Use the ratio of full length to truncated length as a rough page estimate
+    totalPages = Math.ceil(fullMarkdown.length / (markdown.length * 0.9));
+  }
+
+  logger.info('[Firecrawl] Scrape completed', {
+    url,
+    hasContent: !!fullMarkdown,
+    rawChars: fullMarkdown.length,
+    truncatedChars: markdown.length,
+    wasTruncated,
+    totalPages
+  });
 
   return {
     success: true,
     data: {
       url,
-      title: data.title || '',
-      markdown: data.markdown || '',
+      title,
+      markdown,
       metadata: data.metadata || {},
-      message: `Successfully scraped ${url}`
+      ...(wasTruncated ? {
+        truncated: true,
+        totalPages,
+        message: `Successfully scraped ${url} (showing page 1 of ~${totalPages}). Use firecrawl_read_more with this URL and page=2 to see more content.`
+      } : {
+        message: `Successfully scraped ${url}`
+      })
+    }
+  };
+}
+
+// Execute Firecrawl read more — paginate through cached scrape content
+async function executeFirecrawlReadMore(
+  url: string,
+  page: number
+): Promise<ToolResult> {
+  const cached = scrapeCache.get(url);
+  if (!cached) {
+    return {
+      success: false,
+      error: `No cached content for "${url}". You need to scrape the URL first using firecrawl_scrape.`
+    };
+  }
+
+  // Compute the character offset for this page.
+  // Page 1 was the truncated first chunk. We need to figure out where page 1 ended.
+  // We'll re-truncate to get the exact first page length, then slice from there.
+  const firstPage = truncateScrapeContent(cached.fullMarkdown);
+  // Strip the truncation notice to get the actual content boundary
+  const truncNotice = '\n\n... (content truncated — page was too long)';
+  const firstPageContent = firstPage.endsWith(truncNotice)
+    ? firstPage.slice(0, -truncNotice.length)
+    : firstPage;
+
+  const pageSize = firstPageContent.length;
+  const startOffset = pageSize * (page - 1);
+
+  if (startOffset >= cached.fullMarkdown.length) {
+    return {
+      success: false,
+      error: `Page ${page} is beyond the end of the content. The page only has content up to page ${Math.ceil(cached.fullMarkdown.length / pageSize)}.`
+    };
+  }
+
+  const chunk = cached.fullMarkdown.slice(startOffset, startOffset + pageSize);
+  const totalPages = Math.ceil(cached.fullMarkdown.length / pageSize);
+  const hasMore = startOffset + pageSize < cached.fullMarkdown.length;
+
+  logger.info('[Firecrawl] Read more', {
+    url,
+    page,
+    totalPages,
+    chunkChars: chunk.length,
+    hasMore
+  });
+
+  return {
+    success: true,
+    data: {
+      url,
+      title: cached.title,
+      page,
+      totalPages,
+      markdown: chunk,
+      ...(hasMore ? {
+        message: `Page ${page} of ~${totalPages} for ${url}. Use firecrawl_read_more with page=${page + 1} for more.`
+      } : {
+        message: `Page ${page} of ${totalPages} for ${url} (last page).`
+      })
     }
   };
 }
@@ -1076,19 +1112,95 @@ async function executeFirecrawlMap(
 }
 
 // ============================================================================
+// VERSION SNAPSHOT TOOL EXECUTORS
+// ============================================================================
+
+// List all version snapshots for an idea
+export function executeListVersionSnapshots(ideaId: string): ToolResult {
+  try {
+    const snapshots = snapshotsService.getSnapshots(ideaId);
+
+    if (snapshots.length === 0) {
+      return {
+        success: true,
+        data: { message: 'No version snapshots exist yet. Snapshots are created automatically after each AI modification.' }
+      };
+    }
+
+    const versions = snapshots.map(s => ({
+      versionNumber: s.versionNumber,
+      createdAt: s.createdAt,
+      toolsUsed: s.toolsUsed ? JSON.parse(s.toolsUsed) : []
+    }));
+
+    return {
+      success: true,
+      data: {
+        totalVersions: versions.length,
+        versions
+      }
+    };
+  } catch (error) {
+    return { success: false, error: `Failed to list snapshots: ${error instanceof Error ? error.message : String(error)}` };
+  }
+}
+
+// Read data from a specific version snapshot
+export function executeReadVersionSnapshot(
+  ideaId: string,
+  versionNumber: number,
+  scope: string
+): ToolResult {
+  try {
+    const snapshot = snapshotsService.getSnapshotByVersion(ideaId, versionNumber);
+
+    if (!snapshot) {
+      // Help the AI by listing available versions
+      const available = snapshotsService.getSnapshots(ideaId);
+      const versionNumbers = available.map(s => s.versionNumber);
+      return {
+        success: false,
+        error: `Version ${versionNumber} not found. Available versions: ${versionNumbers.length > 0 ? versionNumbers.join(', ') : 'none'}`
+      };
+    }
+
+    const result: Record<string, unknown> = {
+      versionNumber: snapshot.versionNumber,
+      createdAt: snapshot.createdAt
+    };
+
+    // Return data based on scope
+    if (scope === 'synthesis' || scope === 'all') {
+      result.synthesis = snapshot.synthesisContent || '(empty)';
+    }
+
+    if (scope === 'app' || scope === 'all') {
+      const files: Array<{ filePath: string; content: string; fileType: string; isEntryFile: boolean }> = JSON.parse(snapshot.filesSnapshot);
+      result.files = files.map(f => ({
+        filePath: f.filePath,
+        fileType: f.fileType,
+        isEntryFile: f.isEntryFile,
+        lineCount: f.content.split('\n').length,
+        content: f.content
+      }));
+    }
+
+    if (scope === 'dependencies' || scope === 'all') {
+      const nodes: Array<Record<string, unknown>> = JSON.parse(snapshot.nodesSnapshot);
+      const connections: Array<Record<string, unknown>> = JSON.parse(snapshot.connectionsSnapshot);
+      result.dependencyNodes = nodes;
+      result.dependencyConnections = connections;
+    }
+
+    return { success: true, data: result };
+  } catch (error) {
+    return { success: false, error: `Failed to read snapshot: ${error instanceof Error ? error.message : String(error)}` };
+  }
+}
+
+// ============================================================================
 // ALL TOOLS COMBINED - Use this everywhere, AI always has access to everything
 // ============================================================================
 // Returns all tools combined - called at runtime to avoid circular dependency
-export function getAllTools(): Anthropic.Tool[] {
-  const tools = [
-    ...ideaSynthesisTools,
-    ...getDependencyNodeTools(),
-    firecrawlSearchTool,
-    firecrawlScrapeTool,
-    firecrawlMapTool
-  ];
-  // Log tool names for debugging
-  const toolNames = tools.map(t => t.name);
-  logger.info('[getAllTools] Returning tools', { count: tools.length, tools: toolNames });
-  return tools;
-}
+// Note: Tool definitions above (ideaSynthesisTools, firecrawl*Tool) are legacy —
+// tools are now served via MCP in mcpToolServer.ts

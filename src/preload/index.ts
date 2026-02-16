@@ -2,36 +2,34 @@ import { contextBridge, ipcRenderer, IpcRendererEvent } from 'electron';
 
 // AI IPC channel names (must match main process)
 const AI_CHANNELS = {
-  INITIALIZE: 'ai:initialize',
-  CHAT: 'ai:chat',
-  CHAT_STREAM: 'ai:chat-stream',
-  CHAT_STREAM_CHUNK: 'ai:chat-stream-chunk',
-  CHAT_STREAM_END: 'ai:chat-stream-end',
-  CHAT_STREAM_ERROR: 'ai:chat-stream-error',
-  IS_INITIALIZED: 'ai:is-initialized',
-  CLEAR: 'ai:clear',
-  // Synthesis-specific channels
   SYNTHESIS_STREAM: 'ai:synthesis-stream',
   SYNTHESIS_STREAM_EVENT: 'ai:synthesis-stream-event',
   SYNTHESIS_STREAM_END: 'ai:synthesis-stream-end',
   SYNTHESIS_STREAM_ERROR: 'ai:synthesis-stream-error',
-  SYNTHESIS_ABORT: 'ai:synthesis-abort'
+  SYNTHESIS_ABORT: 'ai:synthesis-abort',
+  CHECK_AVAILABLE: 'ai:check-available'
 } as const;
 
-// File builder IPC channel names (must match main process)
-const FILE_BUILDER_CHANNELS = {
-  FILES_CREATE: 'files:create',
-  FILES_READ: 'files:read',
-  FILES_UPDATE: 'files:update',
-  FILES_DELETE: 'files:delete',
-  FILES_LIST: 'files:list',
-  FILES_GET_ENTRY: 'files:get-entry',
-  FILES_SET_ENTRY: 'files:set-entry',
-  FILES_MODIFY_LINES: 'files:modify-lines',
-  APP_BUILDER_STREAM: 'ai:app-builder-stream',
-  APP_BUILDER_STREAM_EVENT: 'ai:app-builder-stream-event',
-  APP_BUILDER_STREAM_END: 'ai:app-builder-stream-end',
-  APP_BUILDER_STREAM_ERROR: 'ai:app-builder-stream-error'
+// Dev server IPC channel names
+const DEVSERVER_CHANNELS = {
+  START: 'devserver:start',
+  STOP: 'devserver:stop',
+  STATUS: 'devserver:status'
+} as const;
+
+// Snapshot IPC channel names
+const SNAPSHOT_CHANNELS = {
+  LIST: 'snapshots:list',
+  GET: 'snapshots:get',
+  RESTORE: 'snapshots:restore',
+  CREATED: 'idea:snapshot-created'
+} as const;
+
+// Backup IPC channel names
+const BACKUP_CHANNELS = {
+  CREATE: 'backup:create',
+  LIST: 'backup:list',
+  DELETE: 'backup:delete'
 } as const;
 
 // Web search result interface
@@ -59,7 +57,7 @@ interface ProposedNote {
 // web_search_result: Emitted with search results
 // note_proposal: Emitted when AI proposes adding a note (requires user approval)
 interface SynthesisStreamEvent {
-  type: 'thinking_start' | 'thinking' | 'thinking_done' | 'text' | 'tool_start' | 'tool_input_delta' | 'tool_use' | 'tool_result' | 'web_search' | 'web_search_result' | 'note_proposal' | 'done';
+  type: 'thinking_start' | 'thinking' | 'thinking_done' | 'text' | 'tool_start' | 'tool_input_delta' | 'tool_use' | 'tool_result' | 'web_search' | 'web_search_result' | 'note_proposal' | 'round_complete' | 'error_user_message' | 'tool_progress' | 'subagent_done' | 'done';
   content?: string;
   toolCall?: { id: string; name: string; input: Record<string, unknown> };
   toolId?: string;
@@ -74,6 +72,10 @@ interface SynthesisStreamEvent {
   proposal?: ProposedNote;
   // Token usage (from done event)
   usage?: { inputTokens: number; outputTokens: number };
+  // Sub-agent fields
+  parentToolUseId?: string;
+  elapsedSeconds?: number;
+  summary?: string;
 }
 
 // Database IPC channel names (must match main process)
@@ -86,7 +88,8 @@ const DB_CHANNELS = {
   GET_CONVERSATION_WITH_MESSAGES: 'db:get-conversation-with-messages',
   ADD_MESSAGE: 'db:add-message',
   GET_MESSAGES: 'db:get-messages',
-  DELETE_MESSAGE: 'db:delete-message'
+  DELETE_MESSAGE: 'db:delete-message',
+  UPDATE_MESSAGE_CONTENT_BLOCKS: 'db:update-message-content-blocks'
 } as const;
 
 // Ideas IPC channel names (must match main process)
@@ -111,26 +114,18 @@ const IDEAS_CHANNELS = {
   STT_IS_INITIALIZED: 'stt:is-initialized',
   STT_TRANSCRIBE: 'stt:transcribe',
   STT_CLEAR: 'stt:clear',
+  // Real-time STT
+  REALTIME_STT_START: 'realtime-stt:start',
+  REALTIME_STT_SEND_AUDIO: 'realtime-stt:send-audio',
+  REALTIME_STT_STOP: 'realtime-stt:stop',
+  REALTIME_STT_GET_TRANSCRIPT: 'realtime-stt:get-transcript',
+  REALTIME_STT_DELTA: 'realtime-stt:delta',
+  REALTIME_STT_COMPLETE: 'realtime-stt:complete',
+  REALTIME_STT_ERROR: 'realtime-stt:error',
   DEV_SEED: 'dev:seed'
 } as const;
 
-// Message type for chat
-interface ChatMessage {
-  role: 'user' | 'assistant' | 'system';
-  content: string;
-}
-
-// Response from the LLM
-interface LLMResponse {
-  content: string;
-  tokenUsage?: {
-    input: number;
-    output: number;
-    total: number;
-  };
-}
-
-// Initialize result type
+// Initialize result type (used by STT)
 interface InitializeResult {
   success: boolean;
   error?: string;
@@ -198,17 +193,6 @@ interface ProjectFile {
   updatedAt: Date;
 }
 
-// App builder stream event type
-interface AppBuilderStreamEvent {
-  type: 'thinking_start' | 'thinking' | 'thinking_done' | 'text' | 'tool_start' | 'tool_input_delta' | 'tool_use' | 'tool_result' | 'done';
-  content?: string;
-  toolCall?: { id: string; name: string; input: Record<string, unknown> };
-  toolId?: string;
-  toolName?: string;
-  partialInput?: string;
-  result?: { success: boolean; data?: unknown; error?: string };
-  stopReason?: string;
-}
 
 // Dependency Nodes IPC channel names (must match main process)
 const DEPENDENCY_NODES_CHANNELS = {
@@ -266,7 +250,7 @@ interface DependencyNodeConnection {
 
 // Dependency Nodes stream event type
 interface DependencyNodesStreamEvent {
-  type: 'thinking_start' | 'thinking' | 'thinking_done' | 'text' | 'tool_start' | 'tool_input_delta' | 'tool_use' | 'tool_result' | 'web_search' | 'web_search_result' | 'note_proposal' | 'done';
+  type: 'thinking_start' | 'thinking' | 'thinking_done' | 'text' | 'tool_start' | 'tool_input_delta' | 'tool_use' | 'tool_result' | 'web_search' | 'web_search_result' | 'note_proposal' | 'round_complete' | 'error_user_message' | 'done';
   content?: string;
   toolCall?: { id: string; name: string; input: Record<string, unknown> };
   toolId?: string;
@@ -279,6 +263,48 @@ interface DependencyNodesStreamEvent {
   proposal?: { id: string; title: string; content: string; category: string; ideaId: string };
 }
 
+// Idea snapshot interface
+interface IdeaSnapshot {
+  id: string;
+  ideaId: string;
+  versionNumber: number;
+  synthesisContent: string | null;
+  filesSnapshot: string;
+  nodesSnapshot: string;
+  connectionsSnapshot: string;
+  toolsUsed: string | null;
+  createdAt: Date;
+}
+
+// Conversation branch interface
+interface ConversationBranch {
+  id: string;
+  ideaId: string;
+  parentBranchId: string | null;
+  conversationId: string | null;
+  label: string;
+  depth: number;
+  synthesisContent: string | null;
+  filesSnapshot: string;
+  nodesSnapshot: string;
+  connectionsSnapshot: string;
+  isActive: boolean;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+// Branch IPC channel names
+const BRANCH_CHANNELS = {
+  GET_ALL: 'branches:get-all',
+  GET: 'branches:get',
+  GET_ACTIVE: 'branches:get-active',
+  ENSURE_ROOT: 'branches:ensure-root',
+  CREATE_CHILD: 'branches:create-child',
+  SWITCH_TO: 'branches:switch-to',
+  DELETE: 'branches:delete',
+  UPDATE_LABEL: 'branches:update-label'
+} as const;
+
 // Panel error interface
 interface PanelError {
   timestamp: Date;
@@ -288,6 +314,24 @@ interface PanelError {
   line?: number;
   column?: number;
   stack?: string;
+}
+
+// Voice agent IPC channel names
+const VOICE_AGENT_CHANNELS = {
+  RUN: 'voice-agent:run',
+  EVENT: 'voice-agent:event',
+  END: 'voice-agent:end',
+  ERROR: 'voice-agent:error',
+  ABORT: 'voice-agent:abort'
+} as const;
+
+// Voice agent stream event type
+interface VoiceAgentStreamEvent {
+  type: 'text' | 'tool_start' | 'tool_use' | 'tool_result' | 'done';
+  content?: string;
+  toolId?: string;
+  toolName?: string;
+  stopReason?: string;
 }
 
 // Panel error IPC channel names
@@ -306,46 +350,17 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Platform information
   platform: process.platform,
 
-  // AI API methods
+  // AI API methods — Claude Code Agent SDK (no API key needed)
   ai: {
-    initialize: (apiKey: string): Promise<InitializeResult> => {
-      return ipcRenderer.invoke(AI_CHANNELS.INITIALIZE, apiKey);
+    // Check if Claude Code CLI is available on this system
+    checkAvailable: (): Promise<boolean> => {
+      return ipcRenderer.invoke(AI_CHANNELS.CHECK_AVAILABLE);
     },
-    isInitialized: (): Promise<boolean> => {
-      return ipcRenderer.invoke(AI_CHANNELS.IS_INITIALIZED);
-    },
-    chat: (messages: ChatMessage[]): Promise<LLMResponse> => {
-      return ipcRenderer.invoke(AI_CHANNELS.CHAT, messages);
-    },
-    chatStream: (
-      messages: ChatMessage[],
-      onChunk: (chunk: string) => void,
-      onEnd: () => void,
-      onError: (error: string) => void
-    ): Promise<() => void> => {
-      const chunkHandler = (_event: IpcRendererEvent, chunk: string) => onChunk(chunk);
-      const endHandler = () => onEnd();
-      const errorHandler = (_event: IpcRendererEvent, error: string) => onError(error);
 
-      ipcRenderer.on(AI_CHANNELS.CHAT_STREAM_CHUNK, chunkHandler);
-      ipcRenderer.once(AI_CHANNELS.CHAT_STREAM_END, endHandler);
-      ipcRenderer.once(AI_CHANNELS.CHAT_STREAM_ERROR, errorHandler);
-
-      ipcRenderer.invoke(AI_CHANNELS.CHAT_STREAM, messages);
-
-      return Promise.resolve(() => {
-        ipcRenderer.removeListener(AI_CHANNELS.CHAT_STREAM_CHUNK, chunkHandler);
-        ipcRenderer.removeListener(AI_CHANNELS.CHAT_STREAM_END, endHandler);
-        ipcRenderer.removeListener(AI_CHANNELS.CHAT_STREAM_ERROR, errorHandler);
-      });
-    },
-    clear: (): Promise<void> => {
-      return ipcRenderer.invoke(AI_CHANNELS.CLEAR);
-    },
-    // Synthesis stream with tools support
+    // Synthesis stream via Claude Code subprocess + MCP tools
     synthesisStream: (
       ideaId: string,
-      messages: ChatMessage[],
+      messageText: string,
       onEvent: (event: SynthesisStreamEvent) => void,
       onEnd: () => void,
       onError: (error: string) => void
@@ -358,7 +373,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
       ipcRenderer.once(AI_CHANNELS.SYNTHESIS_STREAM_END, endHandler);
       ipcRenderer.once(AI_CHANNELS.SYNTHESIS_STREAM_ERROR, errorHandler);
 
-      ipcRenderer.invoke(AI_CHANNELS.SYNTHESIS_STREAM, ideaId, messages);
+      ipcRenderer.invoke(AI_CHANNELS.SYNTHESIS_STREAM, ideaId, messageText);
 
       return Promise.resolve(() => {
         ipcRenderer.removeListener(AI_CHANNELS.SYNTHESIS_STREAM_EVENT, eventHandler);
@@ -409,6 +424,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
     },
     deleteMessage: (id: string): Promise<void> => {
       return ipcRenderer.invoke(DB_CHANNELS.DELETE_MESSAGE, id);
+    },
+    updateMessageContentBlocks: (id: string, contentBlocks: unknown[]): Promise<void> => {
+      return ipcRenderer.invoke(DB_CHANNELS.UPDATE_MESSAGE_CONTENT_BLOCKS, id, contentBlocks);
     }
   },
 
@@ -475,7 +493,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     }
   },
 
-  // Speech-to-text API methods
+  // Speech-to-text API methods (batch transcription)
   stt: {
     initialize: (apiKey: string): Promise<InitializeResult> => {
       return ipcRenderer.invoke(IDEAS_CHANNELS.STT_INITIALIZE, apiKey);
@@ -491,6 +509,38 @@ contextBridge.exposeInMainWorld('electronAPI', {
     }
   },
 
+  // Real-time speech-to-text API methods (streaming transcription)
+  realtimeStt: {
+    start: (language?: string): Promise<InitializeResult> => {
+      return ipcRenderer.invoke(IDEAS_CHANNELS.REALTIME_STT_START, language || 'ro');
+    },
+    sendAudio: (audioData: number[]): Promise<void> => {
+      return ipcRenderer.invoke(IDEAS_CHANNELS.REALTIME_STT_SEND_AUDIO, audioData);
+    },
+    stop: (): Promise<string> => {
+      return ipcRenderer.invoke(IDEAS_CHANNELS.REALTIME_STT_STOP);
+    },
+    getTranscript: (): Promise<string> => {
+      return ipcRenderer.invoke(IDEAS_CHANNELS.REALTIME_STT_GET_TRANSCRIPT);
+    },
+    // Event listeners for real-time updates
+    onDelta: (callback: (delta: string) => void): (() => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, delta: string) => callback(delta);
+      ipcRenderer.on(IDEAS_CHANNELS.REALTIME_STT_DELTA, handler);
+      return () => ipcRenderer.removeListener(IDEAS_CHANNELS.REALTIME_STT_DELTA, handler);
+    },
+    onComplete: (callback: (transcript: string) => void): (() => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, transcript: string) => callback(transcript);
+      ipcRenderer.on(IDEAS_CHANNELS.REALTIME_STT_COMPLETE, handler);
+      return () => ipcRenderer.removeListener(IDEAS_CHANNELS.REALTIME_STT_COMPLETE, handler);
+    },
+    onError: (callback: (error: string) => void): (() => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, error: string) => callback(error);
+      ipcRenderer.on(IDEAS_CHANNELS.REALTIME_STT_ERROR, handler);
+      return () => ipcRenderer.removeListener(IDEAS_CHANNELS.REALTIME_STT_ERROR, handler);
+    }
+  },
+
   // Dev API methods
   dev: {
     seed: (): Promise<{ ideas: number; notes: number }> => {
@@ -498,62 +548,22 @@ contextBridge.exposeInMainWorld('electronAPI', {
     }
   },
 
-  // Sandbox preload bundle
-  sandbox: {
-    getPreload: (): Promise<{ success: boolean; content?: string; error?: string }> => {
-      return ipcRenderer.invoke('sandbox:get-preload');
+  // Dev server API methods
+  shell: {
+    openExternal: (url: string): Promise<void> => {
+      return ipcRenderer.invoke('shell:open-external', url);
     }
   },
 
-  // Files API methods for app builder
-  files: {
-    create: (ideaId: string, filePath: string, content: string, isEntryFile?: boolean): Promise<ProjectFile> => {
-      return ipcRenderer.invoke(FILE_BUILDER_CHANNELS.FILES_CREATE, ideaId, filePath, content, isEntryFile);
+  devServer: {
+    start: (ideaId: string): Promise<{ port: number; success: boolean; error?: string }> => {
+      return ipcRenderer.invoke(DEVSERVER_CHANNELS.START, ideaId);
     },
-    read: (ideaId: string, filePath: string): Promise<ProjectFile | null> => {
-      return ipcRenderer.invoke(FILE_BUILDER_CHANNELS.FILES_READ, ideaId, filePath);
+    stop: (): Promise<{ success: boolean }> => {
+      return ipcRenderer.invoke(DEVSERVER_CHANNELS.STOP);
     },
-    update: (ideaId: string, filePath: string, content: string): Promise<ProjectFile> => {
-      return ipcRenderer.invoke(FILE_BUILDER_CHANNELS.FILES_UPDATE, ideaId, filePath, content);
-    },
-    delete: (ideaId: string, filePath: string): Promise<{ success: boolean }> => {
-      return ipcRenderer.invoke(FILE_BUILDER_CHANNELS.FILES_DELETE, ideaId, filePath);
-    },
-    list: (ideaId: string): Promise<ProjectFile[]> => {
-      return ipcRenderer.invoke(FILE_BUILDER_CHANNELS.FILES_LIST, ideaId);
-    },
-    getEntryFile: (ideaId: string): Promise<ProjectFile | null> => {
-      return ipcRenderer.invoke(FILE_BUILDER_CHANNELS.FILES_GET_ENTRY, ideaId);
-    },
-    setEntryFile: (ideaId: string, filePath: string): Promise<ProjectFile> => {
-      return ipcRenderer.invoke(FILE_BUILDER_CHANNELS.FILES_SET_ENTRY, ideaId, filePath);
-    },
-    modifyLines: (ideaId: string, filePath: string, startLine: number, endLine: number, newContent: string): Promise<ProjectFile> => {
-      return ipcRenderer.invoke(FILE_BUILDER_CHANNELS.FILES_MODIFY_LINES, ideaId, filePath, startLine, endLine, newContent);
-    },
-    // App builder AI stream with file tools
-    appBuilderStream: (
-      ideaId: string,
-      messages: ChatMessage[],
-      onEvent: (event: AppBuilderStreamEvent) => void,
-      onEnd: () => void,
-      onError: (error: string) => void
-    ): Promise<() => void> => {
-      const eventHandler = (_event: IpcRendererEvent, streamEvent: AppBuilderStreamEvent) => onEvent(streamEvent);
-      const endHandler = () => onEnd();
-      const errorHandler = (_event: IpcRendererEvent, error: string) => onError(error);
-
-      ipcRenderer.on(FILE_BUILDER_CHANNELS.APP_BUILDER_STREAM_EVENT, eventHandler);
-      ipcRenderer.once(FILE_BUILDER_CHANNELS.APP_BUILDER_STREAM_END, endHandler);
-      ipcRenderer.once(FILE_BUILDER_CHANNELS.APP_BUILDER_STREAM_ERROR, errorHandler);
-
-      ipcRenderer.invoke(FILE_BUILDER_CHANNELS.APP_BUILDER_STREAM, ideaId, messages);
-
-      return Promise.resolve(() => {
-        ipcRenderer.removeListener(FILE_BUILDER_CHANNELS.APP_BUILDER_STREAM_EVENT, eventHandler);
-        ipcRenderer.removeListener(FILE_BUILDER_CHANNELS.APP_BUILDER_STREAM_END, endHandler);
-        ipcRenderer.removeListener(FILE_BUILDER_CHANNELS.APP_BUILDER_STREAM_ERROR, errorHandler);
-      });
+    status: (): Promise<{ port: number; ideaId: string } | null> => {
+      return ipcRenderer.invoke(DEVSERVER_CHANNELS.STATUS);
     }
   },
 
@@ -603,10 +613,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
     getFullState: (ideaId: string): Promise<{ nodes: DependencyNode[]; connections: DependencyNodeConnection[] }> => {
       return ipcRenderer.invoke(DEPENDENCY_NODES_CHANNELS.NODES_FULL_STATE, ideaId);
     },
-    // Dependency nodes AI stream with node tools
+    // Dependency nodes AI stream via Claude Code subprocess + MCP tools
     dependencyNodesStream: (
       ideaId: string,
-      messages: ChatMessage[],
+      messageText: string,
       onEvent: (event: DependencyNodesStreamEvent) => void,
       onEnd: () => void,
       onError: (error: string) => void
@@ -619,7 +629,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
       ipcRenderer.once(DEPENDENCY_NODES_CHANNELS.DEPENDENCY_NODES_STREAM_END, endHandler);
       ipcRenderer.once(DEPENDENCY_NODES_CHANNELS.DEPENDENCY_NODES_STREAM_ERROR, errorHandler);
 
-      ipcRenderer.invoke(DEPENDENCY_NODES_CHANNELS.DEPENDENCY_NODES_STREAM, ideaId, messages);
+      ipcRenderer.invoke(DEPENDENCY_NODES_CHANNELS.DEPENDENCY_NODES_STREAM, ideaId, messageText);
 
       return Promise.resolve(() => {
         ipcRenderer.removeListener(DEPENDENCY_NODES_CHANNELS.DEPENDENCY_NODES_STREAM_EVENT, eventHandler);
@@ -681,6 +691,97 @@ contextBridge.exposeInMainWorld('electronAPI', {
     getLogPath: (): Promise<string> => {
       return ipcRenderer.invoke(PANEL_ERROR_CHANNELS.GET_LOG_PATH);
     }
+  },
+
+  // Voice Agent API — voice-controlled app navigation via Haiku
+  voiceAgent: {
+    run: (
+      ideaId: string,
+      command: string,
+      onEvent: (event: VoiceAgentStreamEvent) => void,
+      onEnd: () => void,
+      onError: (error: string) => void
+    ): Promise<() => void> => {
+      const eventHandler = (_event: IpcRendererEvent, streamEvent: VoiceAgentStreamEvent) => onEvent(streamEvent);
+      const endHandler = () => onEnd();
+      const errorHandler = (_event: IpcRendererEvent, error: string) => onError(error);
+
+      ipcRenderer.on(VOICE_AGENT_CHANNELS.EVENT, eventHandler);
+      ipcRenderer.once(VOICE_AGENT_CHANNELS.END, endHandler);
+      ipcRenderer.once(VOICE_AGENT_CHANNELS.ERROR, errorHandler);
+
+      ipcRenderer.invoke(VOICE_AGENT_CHANNELS.RUN, ideaId, command);
+
+      return Promise.resolve(() => {
+        ipcRenderer.removeListener(VOICE_AGENT_CHANNELS.EVENT, eventHandler);
+        ipcRenderer.removeListener(VOICE_AGENT_CHANNELS.END, endHandler);
+        ipcRenderer.removeListener(VOICE_AGENT_CHANNELS.ERROR, errorHandler);
+      });
+    },
+    abort: (ideaId: string): Promise<{ success: boolean }> => {
+      return ipcRenderer.invoke(VOICE_AGENT_CHANNELS.ABORT, ideaId);
+    }
+  },
+
+  // Branches API - git-like conversation tree
+  branches: {
+    getAll: (ideaId: string): Promise<ConversationBranch[]> => {
+      return ipcRenderer.invoke(BRANCH_CHANNELS.GET_ALL, ideaId);
+    },
+    get: (branchId: string): Promise<ConversationBranch | null> => {
+      return ipcRenderer.invoke(BRANCH_CHANNELS.GET, branchId);
+    },
+    getActive: (ideaId: string): Promise<ConversationBranch | null> => {
+      return ipcRenderer.invoke(BRANCH_CHANNELS.GET_ACTIVE, ideaId);
+    },
+    ensureRoot: (ideaId: string): Promise<ConversationBranch> => {
+      return ipcRenderer.invoke(BRANCH_CHANNELS.ENSURE_ROOT, ideaId);
+    },
+    createChild: (parentBranchId: string, label?: string): Promise<ConversationBranch> => {
+      return ipcRenderer.invoke(BRANCH_CHANNELS.CREATE_CHILD, parentBranchId, label);
+    },
+    switchTo: (branchId: string): Promise<{ success: boolean }> => {
+      return ipcRenderer.invoke(BRANCH_CHANNELS.SWITCH_TO, branchId);
+    },
+    delete: (branchId: string): Promise<{ success: boolean }> => {
+      return ipcRenderer.invoke(BRANCH_CHANNELS.DELETE, branchId);
+    },
+    updateLabel: (branchId: string, label: string): Promise<ConversationBranch> => {
+      return ipcRenderer.invoke(BRANCH_CHANNELS.UPDATE_LABEL, branchId, label);
+    }
+  },
+
+  // Snapshots API - version snapshots of idea state
+  snapshots: {
+    list: (ideaId: string): Promise<IdeaSnapshot[]> => {
+      return ipcRenderer.invoke(SNAPSHOT_CHANNELS.LIST, ideaId);
+    },
+    get: (snapshotId: string): Promise<IdeaSnapshot | null> => {
+      return ipcRenderer.invoke(SNAPSHOT_CHANNELS.GET, snapshotId);
+    },
+    restore: (snapshotId: string): Promise<{ success: boolean }> => {
+      return ipcRenderer.invoke(SNAPSHOT_CHANNELS.RESTORE, snapshotId);
+    },
+    onCreated: (callback: (data: { ideaId: string; versionNumber: number; snapshotId: string }) => void): () => void => {
+      const handler = (_event: IpcRendererEvent, data: { ideaId: string; versionNumber: number; snapshotId: string }) => callback(data);
+      ipcRenderer.on(SNAPSHOT_CHANNELS.CREATED, handler);
+      return () => {
+        ipcRenderer.removeListener(SNAPSHOT_CHANNELS.CREATED, handler);
+      };
+    }
+  },
+
+  // Backup API — full app backups (DB + project folders)
+  backup: {
+    create: (): Promise<{ success: boolean; path: string; timestamp: string }> => {
+      return ipcRenderer.invoke(BACKUP_CHANNELS.CREATE);
+    },
+    list: (): Promise<Array<{ timestamp: string; path: string; createdAt: string }>> => {
+      return ipcRenderer.invoke(BACKUP_CHANNELS.LIST);
+    },
+    delete: (timestamp: string): Promise<{ success: boolean }> => {
+      return ipcRenderer.invoke(BACKUP_CHANNELS.DELETE, timestamp);
+    }
   }
 });
 
@@ -690,19 +791,10 @@ declare global {
     electronAPI: {
       platform: NodeJS.Platform;
       ai: {
-        initialize: (apiKey: string) => Promise<InitializeResult>;
-        isInitialized: () => Promise<boolean>;
-        chat: (messages: ChatMessage[]) => Promise<LLMResponse>;
-        chatStream: (
-          messages: ChatMessage[],
-          onChunk: (chunk: string) => void,
-          onEnd: () => void,
-          onError: (error: string) => void
-        ) => Promise<() => void>;
-        clear: () => Promise<void>;
+        checkAvailable: () => Promise<boolean>;
         synthesisStream: (
           ideaId: string,
-          messages: ChatMessage[],
+          messageText: string,
           onEvent: (event: SynthesisStreamEvent) => void,
           onEnd: () => void,
           onError: (error: string) => void
@@ -727,6 +819,7 @@ declare global {
         }) => Promise<Message>;
         getMessages: (conversationId: string) => Promise<Message[]>;
         deleteMessage: (id: string) => Promise<void>;
+        updateMessageContentBlocks: (id: string, contentBlocks: unknown[]) => Promise<void>;
       };
       ideas: {
         create: (data: { title: string }) => Promise<Idea>;
@@ -757,28 +850,25 @@ declare global {
         transcribe: (audioData: number[], mimeType: string) => Promise<TranscriptionResult>;
         clear: () => Promise<void>;
       };
+      realtimeStt: {
+        start: (language?: string) => Promise<InitializeResult>;
+        sendAudio: (audioData: number[]) => Promise<void>;
+        stop: () => Promise<string>;
+        getTranscript: () => Promise<string>;
+        onDelta: (callback: (delta: string) => void) => () => void;
+        onComplete: (callback: (transcript: string) => void) => () => void;
+        onError: (callback: (error: string) => void) => () => void;
+      };
       dev: {
         seed: () => Promise<{ ideas: number; notes: number }>;
       };
-      sandbox: {
-        getPreload: () => Promise<{ success: boolean; content?: string; error?: string }>;
+      shell: {
+        openExternal: (url: string) => Promise<void>;
       };
-      files: {
-        create: (ideaId: string, filePath: string, content: string, isEntryFile?: boolean) => Promise<ProjectFile>;
-        read: (ideaId: string, filePath: string) => Promise<ProjectFile | null>;
-        update: (ideaId: string, filePath: string, content: string) => Promise<ProjectFile>;
-        delete: (ideaId: string, filePath: string) => Promise<{ success: boolean }>;
-        list: (ideaId: string) => Promise<ProjectFile[]>;
-        getEntryFile: (ideaId: string) => Promise<ProjectFile | null>;
-        setEntryFile: (ideaId: string, filePath: string) => Promise<ProjectFile>;
-        modifyLines: (ideaId: string, filePath: string, startLine: number, endLine: number, newContent: string) => Promise<ProjectFile>;
-        appBuilderStream: (
-          ideaId: string,
-          messages: ChatMessage[],
-          onEvent: (event: AppBuilderStreamEvent) => void,
-          onEnd: () => void,
-          onError: (error: string) => void
-        ) => Promise<() => void>;
+      devServer: {
+        start: (ideaId: string) => Promise<{ port: number; success: boolean; error?: string }>;
+        stop: () => Promise<{ success: boolean }>;
+        status: () => Promise<{ port: number; ideaId: string } | null>;
       };
       dependencyNodes: {
         create: (ideaId: string, data: {
@@ -807,7 +897,7 @@ declare global {
         getFullState: (ideaId: string) => Promise<{ nodes: DependencyNode[]; connections: DependencyNodeConnection[] }>;
         dependencyNodesStream: (
           ideaId: string,
-          messages: ChatMessage[],
+          messageText: string,
           onEvent: (event: DependencyNodesStreamEvent) => void,
           onEnd: () => void,
           onError: (error: string) => void
@@ -836,6 +926,37 @@ declare global {
         clear: (ideaId: string) => Promise<void>;
         has: (ideaId: string) => Promise<boolean>;
         getLogPath: () => Promise<string>;
+      };
+      voiceAgent: {
+        run: (
+          ideaId: string,
+          command: string,
+          onEvent: (event: VoiceAgentStreamEvent) => void,
+          onEnd: () => void,
+          onError: (error: string) => void
+        ) => Promise<() => void>;
+        abort: (ideaId: string) => Promise<{ success: boolean }>;
+      };
+      branches: {
+        getAll: (ideaId: string) => Promise<ConversationBranch[]>;
+        get: (branchId: string) => Promise<ConversationBranch | null>;
+        getActive: (ideaId: string) => Promise<ConversationBranch | null>;
+        ensureRoot: (ideaId: string) => Promise<ConversationBranch>;
+        createChild: (parentBranchId: string, label?: string) => Promise<ConversationBranch>;
+        switchTo: (branchId: string) => Promise<{ success: boolean }>;
+        delete: (branchId: string) => Promise<{ success: boolean }>;
+        updateLabel: (branchId: string, label: string) => Promise<ConversationBranch>;
+      };
+      snapshots: {
+        list: (ideaId: string) => Promise<IdeaSnapshot[]>;
+        get: (snapshotId: string) => Promise<IdeaSnapshot | null>;
+        restore: (snapshotId: string) => Promise<{ success: boolean }>;
+        onCreated: (callback: (data: { ideaId: string; versionNumber: number; snapshotId: string }) => void) => () => void;
+      };
+      backup: {
+        create: () => Promise<{ success: boolean; path: string; timestamp: string }>;
+        list: () => Promise<Array<{ timestamp: string; path: string; createdAt: string }>>;
+        delete: (timestamp: string) => Promise<{ success: boolean }>;
       };
     };
   }

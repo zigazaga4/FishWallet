@@ -10,10 +10,12 @@ export const conversations = sqliteTable('conversations', {
   // System prompt for this conversation
   systemPrompt: text('system_prompt'),
   // Model configuration
-  model: text('model').notNull().default('claude-sonnet-4-5-20250929'),
+  model: text('model').notNull().default('claude-opus-4-5-20251101'),
   // Token usage tracking
   totalInputTokens: integer('total_input_tokens').notNull().default(0),
-  totalOutputTokens: integer('total_output_tokens').notNull().default(0)
+  totalOutputTokens: integer('total_output_tokens').notNull().default(0),
+  // Claude Code session ID for context resumption
+  claudeSessionId: text('claude_session_id')
 });
 
 // Messages table - stores individual messages in conversations
@@ -59,7 +61,9 @@ export const ideas = sqliteTable('ideas', {
   // Version number for tracking synthesis changes
   synthesisVersion: integer('synthesis_version').default(0),
   // When the synthesis was last updated
-  synthesisUpdatedAt: integer('synthesis_updated_at', { mode: 'timestamp' })
+  synthesisUpdatedAt: integer('synthesis_updated_at', { mode: 'timestamp' }),
+  // Path to the Vite project folder on disk
+  projectPath: text('project_path')
 });
 
 // Notes table - stores voice notes within an idea
@@ -95,6 +99,8 @@ export const ideasRelations = relations(ideas, ({ many, one }) => ({
   projectFiles: many(projectFiles),
   apiNodes: many(apiNodes),
   apiNodeConnections: many(apiNodeConnections),
+  snapshots: many(ideaSnapshots),
+  branches: many(conversationBranches),
   conversation: one(conversations, {
     fields: [ideas.conversationId],
     references: [conversations.id]
@@ -180,6 +186,71 @@ export const apiNodeConnectionsRelations = relations(apiNodeConnections, ({ one 
   })
 }));
 
+// Idea snapshots table - stores versioned snapshots of idea state
+export const ideaSnapshots = sqliteTable('idea_snapshots', {
+  id: text('id').primaryKey(),
+  ideaId: text('idea_id').notNull().references(() => ideas.id, { onDelete: 'cascade' }),
+  versionNumber: integer('version_number').notNull(),
+  // Snapshot data
+  synthesisContent: text('synthesis_content'),
+  filesSnapshot: text('files_snapshot').notNull(),           // JSON array
+  nodesSnapshot: text('nodes_snapshot').notNull(),            // JSON array
+  connectionsSnapshot: text('connections_snapshot').notNull(), // JSON array
+  // Metadata
+  toolsUsed: text('tools_used'),                              // JSON array of tool names
+  createdAt: integer('created_at', { mode: 'timestamp' }).notNull()
+});
+
+// Define relations for idea snapshots
+export const ideaSnapshotsRelations = relations(ideaSnapshots, ({ one }) => ({
+  idea: one(ideas, {
+    fields: [ideaSnapshots.ideaId],
+    references: [ideas.id]
+  })
+}));
+
+// Conversation branches table - git-like tree structure for idea conversations
+export const conversationBranches = sqliteTable('conversation_branches', {
+  id: text('id').primaryKey(),
+  ideaId: text('idea_id').notNull().references(() => ideas.id, { onDelete: 'cascade' }),
+  parentBranchId: text('parent_branch_id'),  // null = root branch
+  conversationId: text('conversation_id').references(() => conversations.id, { onDelete: 'set null' }),
+  label: text('label').notNull().default('Branch'),
+  depth: integer('depth').notNull().default(0),
+  // Folder name within the idea's project directory (e.g. 'main', 'feature-auth')
+  folderName: text('folder_name'),
+  // Branch state snapshot (same format as ideaSnapshots)
+  synthesisContent: text('synthesis_content'),
+  filesSnapshot: text('files_snapshot').notNull().default('[]'),
+  nodesSnapshot: text('nodes_snapshot').notNull().default('[]'),
+  connectionsSnapshot: text('connections_snapshot').notNull().default('[]'),
+  // Compaction cache — avoids re-compacting when creating multiple children
+  compactionCache: text('compaction_cache'),
+  compactionMessageCount: integer('compaction_message_count'),
+  // Active flag - exactly one branch per idea is active at a time
+  isActive: integer('is_active', { mode: 'boolean' }).notNull().default(false),
+  createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
+  updatedAt: integer('updated_at', { mode: 'timestamp' }).notNull(),
+});
+
+// Define relations for conversation branches
+export const conversationBranchesRelations = relations(conversationBranches, ({ one, many }) => ({
+  idea: one(ideas, {
+    fields: [conversationBranches.ideaId],
+    references: [ideas.id]
+  }),
+  parent: one(conversationBranches, {
+    fields: [conversationBranches.parentBranchId],
+    references: [conversationBranches.id],
+    relationName: 'parentBranch'
+  }),
+  children: many(conversationBranches, { relationName: 'parentBranch' }),
+  conversation: one(conversations, {
+    fields: [conversationBranches.conversationId],
+    references: [conversations.id]
+  })
+}));
+
 // Type exports for use in services
 export type Conversation = typeof conversations.$inferSelect;
 export type NewConversation = typeof conversations.$inferInsert;
@@ -195,3 +266,7 @@ export type ApiNode = typeof apiNodes.$inferSelect;
 export type NewApiNode = typeof apiNodes.$inferInsert;
 export type ApiNodeConnection = typeof apiNodeConnections.$inferSelect;
 export type NewApiNodeConnection = typeof apiNodeConnections.$inferInsert;
+export type IdeaSnapshot = typeof ideaSnapshots.$inferSelect;
+export type NewIdeaSnapshot = typeof ideaSnapshots.$inferInsert;
+export type ConversationBranch = typeof conversationBranches.$inferSelect;
+export type NewConversationBranch = typeof conversationBranches.$inferInsert;

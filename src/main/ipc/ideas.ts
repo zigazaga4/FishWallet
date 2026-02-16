@@ -1,8 +1,10 @@
-import { ipcMain } from 'electron';
+import { ipcMain, BrowserWindow } from 'electron';
 import { ideasService } from '../services/ideas';
 import { speechToTextService, TranscriptionResult } from '../services/speechToText';
+import { realtimeSttService, RealtimeSttSession } from '../services/realtimeStt';
 import { seedDatabase } from '../services/seed';
 import { Idea, Note, Conversation, Message } from '../db/schema';
+import { logger } from '../services/logger';
 
 // IPC channel names for ideas operations
 export const IDEAS_CHANNELS = {
@@ -28,11 +30,21 @@ export const IDEAS_CHANNELS = {
   DELETE_SYNTHESIS: 'ideas:delete-synthesis',
   GET_IDEA_FULL: 'ideas:get-full',
 
-  // Speech-to-text operations
+  // Speech-to-text operations (batch)
   STT_INITIALIZE: 'stt:initialize',
   STT_IS_INITIALIZED: 'stt:is-initialized',
   STT_TRANSCRIBE: 'stt:transcribe',
   STT_CLEAR: 'stt:clear',
+
+  // Real-time speech-to-text operations (streaming)
+  REALTIME_STT_START: 'realtime-stt:start',
+  REALTIME_STT_SEND_AUDIO: 'realtime-stt:send-audio',
+  REALTIME_STT_STOP: 'realtime-stt:stop',
+  REALTIME_STT_GET_TRANSCRIPT: 'realtime-stt:get-transcript',
+  // Events sent from main to renderer
+  REALTIME_STT_DELTA: 'realtime-stt:delta',
+  REALTIME_STT_COMPLETE: 'realtime-stt:complete',
+  REALTIME_STT_ERROR: 'realtime-stt:error',
 
   // Dev operations
   DEV_SEED: 'dev:seed'
@@ -45,7 +57,7 @@ export function registerIdeasHandlers(): void {
   // Create a new idea
   ipcMain.handle(
     IDEAS_CHANNELS.CREATE_IDEA,
-    (_event, data: { title: string }): Idea => {
+    async (_event, data: { title: string }): Promise<Idea> => {
       return ideasService.createIdea(data);
     }
   );
@@ -227,6 +239,94 @@ export function registerIdeasHandlers(): void {
     IDEAS_CHANNELS.STT_CLEAR,
     (): void => {
       speechToTextService.clear();
+    }
+  );
+
+  // REAL-TIME SPEECH-TO-TEXT HANDLERS
+
+  // Active session reference
+  let activeRealtimeSession: RealtimeSttSession | null = null;
+
+  // Start real-time transcription session
+  ipcMain.handle(
+    IDEAS_CHANNELS.REALTIME_STT_START,
+    async (event, language: string = 'ro'): Promise<{ success: boolean; error?: string }> => {
+      try {
+        // Initialize service if not already
+        if (!realtimeSttService.isInitialized()) {
+          realtimeSttService.initializeFromEnv();
+        }
+
+        if (!realtimeSttService.isInitialized()) {
+          return { success: false, error: 'OpenAI API key not configured' };
+        }
+
+        // Get the sender window to send events back
+        const senderWindow = BrowserWindow.fromWebContents(event.sender);
+
+        // Start session with callbacks
+        activeRealtimeSession = await realtimeSttService.startSession({
+          onTranscriptDelta: (delta) => {
+            if (senderWindow && !senderWindow.isDestroyed()) {
+              senderWindow.webContents.send(IDEAS_CHANNELS.REALTIME_STT_DELTA, delta);
+            }
+          },
+          onTranscriptComplete: (transcript) => {
+            if (senderWindow && !senderWindow.isDestroyed()) {
+              senderWindow.webContents.send(IDEAS_CHANNELS.REALTIME_STT_COMPLETE, transcript);
+            }
+          },
+          onError: (error) => {
+            logger.error('[RealtimeSTT-IPC] Error:', error);
+            if (senderWindow && !senderWindow.isDestroyed()) {
+              senderWindow.webContents.send(IDEAS_CHANNELS.REALTIME_STT_ERROR, error);
+            }
+          },
+          onSessionCreated: () => {
+            logger.info('[RealtimeSTT-IPC] Session ready');
+          },
+          onSessionEnded: () => {
+            logger.info('[RealtimeSTT-IPC] Session ended');
+            activeRealtimeSession = null;
+          }
+        }, language);
+
+        return { success: true };
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : 'Failed to start real-time STT';
+        logger.error('[RealtimeSTT-IPC] Start failed:', errorMessage);
+        return { success: false, error: errorMessage };
+      }
+    }
+  );
+
+  // Send audio to real-time session (PCM16 Int16Array)
+  ipcMain.handle(
+    IDEAS_CHANNELS.REALTIME_STT_SEND_AUDIO,
+    (_event, audioData: number[]): void => {
+      if (activeRealtimeSession?.isActive()) {
+        const buffer = Buffer.from(new Int16Array(audioData).buffer);
+        activeRealtimeSession.sendAudio(buffer);
+      }
+    }
+  );
+
+  // Stop real-time transcription session
+  ipcMain.handle(
+    IDEAS_CHANNELS.REALTIME_STT_STOP,
+    (): string => {
+      const transcript = activeRealtimeSession?.getFullTranscript() || '';
+      activeRealtimeSession?.close();
+      activeRealtimeSession = null;
+      return transcript;
+    }
+  );
+
+  // Get current transcript from active session
+  ipcMain.handle(
+    IDEAS_CHANNELS.REALTIME_STT_GET_TRANSCRIPT,
+    (): string => {
+      return activeRealtimeSession?.getFullTranscript() || '';
     }
   );
 

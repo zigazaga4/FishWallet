@@ -19,8 +19,9 @@ interface Note {
 // Recording state
 type RecordingState = 'idle' | 'recording' | 'processing';
 
-// Voice recorder component - TRAE DeepBlue inspired design
-// Guided by the Holy Spirit
+// Voice recorder component with batch transcription
+// Uses gpt-4o-mini-transcribe for best accuracy
+// Supports unlimited duration via automatic chunking (requires ffmpeg)
 export function IdeaRecorder({ ideaId, onBack, onOpenChat }: IdeaRecorderProps): ReactElement {
   const [recordingState, setRecordingState] = useState<RecordingState>('idle');
   const [notes, setNotes] = useState<Note[]>([]);
@@ -29,25 +30,47 @@ export function IdeaRecorder({ ideaId, onBack, onOpenChat }: IdeaRecorderProps):
   const [isAIInitialized, setIsAIInitialized] = useState<boolean>(false);
   const [hasSynthesis, setHasSynthesis] = useState<boolean>(false);
   const [isSynthesizing, setIsSynthesizing] = useState<boolean>(false);
+  const [recordingDuration, setRecordingDuration] = useState<number>(0);
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const recordingStartTimeRef = useRef<number>(0);
+  const streamRef = useRef<MediaStream | null>(null);
+  const durationIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
-  // Load existing data on mount
+  // Cleanup function to stop all media tracks
+  const cleanupStream = (): void => {
+    if (durationIntervalRef.current) {
+      clearInterval(durationIntervalRef.current);
+      durationIntervalRef.current = null;
+    }
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => {
+        track.stop();
+        console.log('[IdeaRecorder] Stopped track:', track.kind, track.label);
+      });
+      streamRef.current = null;
+    }
+    mediaRecorderRef.current = null;
+  };
+
+  // Load existing data on mount and cleanup on unmount
   useEffect(() => {
     loadData();
+
+    // Cleanup on unmount - stop any active recording
+    return () => {
+      console.log('[IdeaRecorder] Unmounting, cleaning up...');
+      cleanupStream();
+    };
   }, [ideaId]);
 
   // Load all data for the idea
   const loadData = async (): Promise<void> => {
     // Check services
-    const [sttInit, aiInit] = await Promise.all([
-      window.electronAPI.stt.isInitialized(),
-      window.electronAPI.ai.isInitialized()
-    ]);
+    const sttInit = await window.electronAPI.stt.isInitialized();
     setIsSTTInitialized(sttInit);
-    setIsAIInitialized(aiInit);
+    setIsAIInitialized(true); // Claude Code Agent SDK — no API key needed
 
     // Load notes
     const loadedNotes = await window.electronAPI.ideas.getNotes(ideaId);
@@ -60,13 +83,26 @@ export function IdeaRecorder({ ideaId, onBack, onOpenChat }: IdeaRecorderProps):
     }
   };
 
+  // Format duration as mm:ss
+  const formatDuration = (seconds: number): string => {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins}:${secs.toString().padStart(2, '0')}`;
+  };
+
   // Start recording
   const startRecording = async (): Promise<void> => {
     try {
       setError(null);
+      setRecordingDuration(0);
+
+      // Clean up any existing stream first
+      cleanupStream();
 
       // Request microphone access
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      streamRef.current = stream;
+      console.log('[IdeaRecorder] Microphone stream acquired');
 
       // Create MediaRecorder
       const mediaRecorder = new MediaRecorder(stream, {
@@ -82,8 +118,9 @@ export function IdeaRecorder({ ideaId, onBack, onOpenChat }: IdeaRecorderProps):
       };
 
       mediaRecorder.onstop = async () => {
-        // Stop all tracks
-        stream.getTracks().forEach(track => track.stop());
+        console.log('[IdeaRecorder] MediaRecorder stopped');
+        // Stop all tracks using cleanup function
+        cleanupStream();
 
         // Process the recording
         await processRecording();
@@ -92,9 +129,17 @@ export function IdeaRecorder({ ideaId, onBack, onOpenChat }: IdeaRecorderProps):
       mediaRecorderRef.current = mediaRecorder;
       recordingStartTimeRef.current = Date.now();
 
+      // Start duration timer
+      durationIntervalRef.current = setInterval(() => {
+        const elapsed = Math.floor((Date.now() - recordingStartTimeRef.current) / 1000);
+        setRecordingDuration(elapsed);
+      }, 1000);
+
       mediaRecorder.start();
       setRecordingState('recording');
     } catch (err) {
+      // Make sure to cleanup on error
+      cleanupStream();
       setError('Could not access microphone. Please grant permission.');
       console.error('Microphone error:', err);
     }
@@ -102,9 +147,20 @@ export function IdeaRecorder({ ideaId, onBack, onOpenChat }: IdeaRecorderProps):
 
   // Stop recording
   const stopRecording = (): void => {
+    console.log('[IdeaRecorder] Stop recording called');
     if (mediaRecorderRef.current && recordingState === 'recording') {
-      mediaRecorderRef.current.stop();
-      setRecordingState('processing');
+      try {
+        mediaRecorderRef.current.stop();
+        setRecordingState('processing');
+      } catch (err) {
+        // If stop fails, force cleanup
+        console.error('[IdeaRecorder] Error stopping recorder:', err);
+        cleanupStream();
+        setRecordingState('idle');
+      }
+    } else {
+      // Force cleanup just in case
+      cleanupStream();
     }
   };
 
@@ -114,11 +170,13 @@ export function IdeaRecorder({ ideaId, onBack, onOpenChat }: IdeaRecorderProps):
       const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
       const durationMs = Date.now() - recordingStartTimeRef.current;
 
+      console.log(`[IdeaRecorder] Processing ${(audioBlob.size / 1024 / 1024).toFixed(2)}MB audio, ${Math.round(durationMs / 1000)}s`);
+
       // Convert blob to array buffer then to number array
       const arrayBuffer = await audioBlob.arrayBuffer();
       const audioData = Array.from(new Uint8Array(arrayBuffer));
 
-      // Transcribe the audio
+      // Transcribe the audio (handles chunking automatically for long audio)
       const result = await window.electronAPI.stt.transcribe(audioData, 'audio/webm');
 
       if (result.text && result.text.trim()) {
@@ -134,10 +192,12 @@ export function IdeaRecorder({ ideaId, onBack, onOpenChat }: IdeaRecorderProps):
       }
 
       setRecordingState('idle');
+      setRecordingDuration(0);
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : 'Failed to process recording';
       setError(errorMessage);
       setRecordingState('idle');
+      setRecordingDuration(0);
       console.error('Processing error:', err);
     }
   };
@@ -286,7 +346,7 @@ export function IdeaRecorder({ ideaId, onBack, onOpenChat }: IdeaRecorderProps):
       )}
 
       {/* Recording button */}
-      <div className="flex justify-center mb-6">
+      <div className="flex justify-center mb-4">
         <button
           onClick={recordingState === 'recording' ? stopRecording : startRecording}
           disabled={recordingState === 'processing' || !isSTTInitialized}
@@ -325,15 +385,31 @@ export function IdeaRecorder({ ideaId, onBack, onOpenChat }: IdeaRecorderProps):
         </button>
       </div>
 
+      {/* Recording duration */}
+      {recordingState === 'recording' && (
+        <div className="text-center mb-2">
+          <span className="text-2xl font-mono text-red-400">
+            {formatDuration(recordingDuration)}
+          </span>
+        </div>
+      )}
+
       {/* Recording status text */}
       <p className="text-center text-sky-300 mb-6 text-sm">
         {recordingState === 'recording'
           ? 'Listening... Tap to stop'
           : recordingState === 'processing'
-            ? 'Processing your words...'
+            ? 'Transcribing your words...'
             : 'Tap to speak your thoughts'
         }
       </p>
+
+      {/* Info about long recordings */}
+      {recordingState === 'idle' && (
+        <p className="text-center text-blue-300/40 mb-6 text-xs">
+          Speak as long as you want - unlimited duration supported
+        </p>
+      )}
 
       {/* Notes list */}
       <div className="flex-1 overflow-auto">
@@ -358,6 +434,7 @@ export function IdeaRecorder({ ideaId, onBack, onOpenChat }: IdeaRecorderProps):
                 <div className="mt-2 flex items-center justify-between text-xs text-blue-200/60">
                   <span>
                     {new Date(note.createdAt).toLocaleTimeString()}
+                    {note.durationMs && ` · ${formatDuration(Math.round(note.durationMs / 1000))}`}
                   </span>
                   <button
                     onClick={() => deleteNote(note.id)}

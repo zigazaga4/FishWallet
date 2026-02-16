@@ -1,19 +1,21 @@
-import { app, BrowserWindow } from 'electron';
+import { app, BrowserWindow, shell, ipcMain } from 'electron';
 import { config } from 'dotenv';
 import { join } from 'path';
 import { createMainWindow } from './window';
 import { registerAIHandlers } from './ipc/ai';
 import { registerDatabaseHandlers } from './ipc/database';
 import { registerIdeasHandlers } from './ipc/ideas';
-import { registerFileBuilderHandlers } from './ipc/fileBuilder';
-import { registerSandboxPreloadHandlers } from './ipc/sandboxPreload';
+import { registerDevServerHandlers } from './ipc/devServer';
+import { shutdownAllDevServers } from './services/devServer';
 import { registerDependencyNodesHandlers } from './ipc/dependencyNodes';
 import { registerMcpHandlers } from './ipc/mcp';
 import { registerPanelErrorHandlers } from './ipc/panelErrors';
+import { registerSnapshotHandlers } from './ipc/snapshots';
+import { registerBranchHandlers } from './ipc/branches';
+import { registerVoiceAgentHandlers } from './ipc/voiceAgent';
+import { registerBackupHandlers } from './ipc/backup';
 import { initializeDatabase, closeDatabase } from './db';
 import { speechToTextService } from './services/speechToText';
-import { langChainService } from './services/langchain';
-import { mcpClientService } from './services/mcpClient';
 import { logger } from './services/logger';
 
 // Load environment variables from .env file
@@ -53,23 +55,23 @@ app.whenReady().then(async () => {
 
   // Auto-initialize services from environment variables
   speechToTextService.initializeFromEnv();
-  langChainService.initializeFromEnv();
 
   // Register IPC handlers before creating window
   registerAIHandlers();
   registerDatabaseHandlers();
   registerIdeasHandlers();
-  registerFileBuilderHandlers();
-  registerSandboxPreloadHandlers();
+  registerDevServerHandlers();
   registerDependencyNodesHandlers();
   registerMcpHandlers();
   registerPanelErrorHandlers();
+  registerSnapshotHandlers();
+  registerBranchHandlers();
+  registerVoiceAgentHandlers();
+  registerBackupHandlers();
 
-  // Initialize MCP (Firecrawl) - use env var or hardcoded fallback
-  const firecrawlApiKey = process.env.FIRECRAWL_API_KEY || 'fc-b992ceca9119406899518232c096f14d';
-  logger.info('[Main] Initializing MCP with API key:', firecrawlApiKey ? 'present' : 'missing', 'source:', process.env.FIRECRAWL_API_KEY ? 'env' : 'hardcoded');
-  mcpClientService.initialize(firecrawlApiKey).catch((error) => {
-    logger.error('[Main] Failed to initialize MCP:', error);
+  // Shell: open URLs in the user's default browser
+  ipcMain.handle('shell:open-external', async (_event, url: string) => {
+    await shell.openExternal(url);
   });
 
   mainWindow = await createMainWindow();
@@ -89,13 +91,9 @@ app.on('window-all-closed', () => {
   }
 });
 
-// Clean up reference, close database, and disconnect MCP when quitting
-app.on('before-quit', async () => {
+// Clean up reference and close database when quitting
+app.on('before-quit', () => {
+  shutdownAllDevServers();
   mainWindow = null;
   closeDatabase();
-
-  // Disconnect MCP server
-  if (mcpClientService.isInitialized()) {
-    await mcpClientService.disconnect();
-  }
 });

@@ -43,7 +43,7 @@ interface IdeaStatisticsProps {
 // Pricing per million tokens (from Anthropic docs - https://platform.claude.com/docs/en/about-claude/pricing)
 const MODEL_PRICING: Record<string, { input: number; output: number; name: string }> = {
   // Claude Opus 4.5
-  'claude-opus-4-5-20251001': { input: 5, output: 25, name: 'Claude Opus 4.5' },
+  'claude-opus-4-5-20251101': { input: 5, output: 25, name: 'Claude Opus 4.5' },
   // Claude Sonnet 4.5
   'claude-sonnet-4-5-20250929': { input: 3, output: 15, name: 'Claude Sonnet 4.5' },
   // Claude Sonnet 4

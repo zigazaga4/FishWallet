@@ -2,7 +2,7 @@
 // Shows the AI's research process as it searches for API information
 // Guided by the Holy Spirit
 
-import { useState, type ReactElement } from 'react';
+import { useState, memo, type ReactElement } from 'react';
 
 // Search result item interface
 interface SearchResultItem {
@@ -20,7 +20,7 @@ interface WebSearchBlockProps {
 }
 
 // Collapsible web search block component - shows AI's web research
-export function WebSearchBlock({ query, results, isSearching }: WebSearchBlockProps): ReactElement {
+export const WebSearchBlock = memo(function WebSearchBlock({ query, results, isSearching }: WebSearchBlockProps): ReactElement {
   const [isExpanded, setIsExpanded] = useState<boolean>(false);
 
   return (
@@ -148,4 +148,4 @@ export function WebSearchBlock({ query, results, isSearching }: WebSearchBlockPr
       )}
     </div>
   );
-}
+});

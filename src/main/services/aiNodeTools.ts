@@ -70,13 +70,17 @@ export const dependencyNodeTools: Anthropic.Tool[] = [
   },
   {
     name: 'update_dependency_node',
-    description: 'Update an existing dependency node. Use this to modify node details, pricing, or position.',
+    description: 'Update an existing dependency node. Use this to modify node details like name, provider, description, pricing, or color. You can identify the node by either its ID or its current name.',
     input_schema: {
       type: 'object' as const,
       properties: {
         node_id: {
           type: 'string',
-          description: 'The ID of the node to update'
+          description: 'The ID of the node to update (optional if node_name is provided)'
+        },
+        node_name: {
+          type: 'string',
+          description: 'The current name of the node to update (optional if node_id is provided). Case-insensitive matching.'
         },
         name: {
           type: 'string',
@@ -106,7 +110,7 @@ export const dependencyNodeTools: Anthropic.Tool[] = [
           description: 'New node color as hex code'
         }
       },
-      required: ['node_id']
+      required: []
     }
   },
   {
@@ -213,7 +217,7 @@ export async function executeDependencyNodeToolCall(
       return executeCreateNode(ideaId, toolInput);
 
     case 'update_dependency_node':
-      return executeUpdateNode(toolInput);
+      return executeUpdateNode(ideaId, toolInput);
 
     case 'delete_dependency_node':
       return executeDeleteNode(toolInput.node_id as string);
@@ -291,8 +295,29 @@ function executeCreateNode(
 }
 
 // Update an existing node
-function executeUpdateNode(input: Record<string, unknown>): ToolResult {
-  const nodeId = input.node_id as string;
+function executeUpdateNode(ideaId: string, input: Record<string, unknown>): ToolResult {
+  let nodeId = input.node_id as string | undefined;
+  const nodeName = input.node_name as string | undefined;
+
+  // If no node_id provided, look up by name
+  if (!nodeId && nodeName) {
+    const state = dependencyNodesService.getFullState(ideaId);
+    const foundNode = state.nodes.find(n => n.name.toLowerCase() === nodeName.toLowerCase());
+    if (!foundNode) {
+      return {
+        success: false,
+        error: `Node "${nodeName}" not found. Available nodes: ${state.nodes.map(n => n.name).join(', ')}`
+      };
+    }
+    nodeId = foundNode.id;
+  }
+
+  if (!nodeId) {
+    return {
+      success: false,
+      error: 'Either node_id or node_name must be provided to identify the node to update.'
+    };
+  }
 
   // Parse pricing/licensing if provided
   let pricing: PricingInfo | undefined;
@@ -307,22 +332,31 @@ function executeUpdateNode(input: Record<string, unknown>): ToolResult {
     };
   }
 
-  const node = dependencyNodesService.updateNode(nodeId, {
-    name: input.name as string | undefined,
-    provider: input.provider as string | undefined,
-    description: input.description as string | undefined,
-    pricing,
-    color: input.color as string | undefined
-  });
+  try {
+    const node = dependencyNodesService.updateNode(nodeId, {
+      name: input.name as string | undefined,
+      provider: input.provider as string | undefined,
+      description: input.description as string | undefined,
+      pricing,
+      color: input.color as string | undefined
+    });
 
-  return {
-    success: true,
-    data: {
-      message: `Updated dependency node: ${node.name}`,
-      nodeId: node.id,
-      name: node.name
-    }
-  };
+    return {
+      success: true,
+      data: {
+        message: `Updated dependency node: ${node.name}`,
+        nodeId: node.id,
+        name: node.name,
+        provider: node.provider,
+        description: node.description
+      }
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: `Failed to update node: ${error instanceof Error ? error.message : 'Unknown error'}`
+    };
+  }
 }
 
 // Delete a node

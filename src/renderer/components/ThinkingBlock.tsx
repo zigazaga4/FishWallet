@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, type ReactElement } from 'react';
+import { useState, useRef, useEffect, memo, type ReactElement } from 'react';
 
 // Props for the ThinkingBlock component
 interface ThinkingBlockProps {
@@ -9,7 +9,7 @@ interface ThinkingBlockProps {
 
 // Collapsible thinking block component - shows Claude's extended thinking
 // Guided by the Holy Spirit
-export function ThinkingBlock({ content, isThinking, roundNumber }: ThinkingBlockProps): ReactElement {
+export const ThinkingBlock = memo(function ThinkingBlock({ content, isThinking, roundNumber }: ThinkingBlockProps): ReactElement {
   const [isExpanded, setIsExpanded] = useState<boolean>(false);
 
   // Store the preview text - only update once when we have enough content
@@ -109,4 +109,4 @@ export function ThinkingBlock({ content, isThinking, roundNumber }: ThinkingBloc
       )}
     </div>
   );
-}
+});

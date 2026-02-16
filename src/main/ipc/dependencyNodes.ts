@@ -1,14 +1,16 @@
 // Dependency Nodes IPC Handler - Handles dependency node operations and AI streaming
-// Guided by the Holy Spirit
+// AI streaming uses Claude Code Agent SDK subprocess with MCP tools
 
 import { ipcMain, BrowserWindow } from 'electron';
 import { dependencyNodesService, PricingInfo } from '../services/dependencyNodes';
-import { executeDependencyNodeToolCall, generateDependencyNodesSystemPrompt } from '../services/aiNodeTools';
-import { getAllTools, executeToolCall } from '../services/aiTools';
-import { langChainService, ChatMessage, StreamEvent, ToolCall, ConversationTurn } from '../services/langchain';
+import { generateDependencyNodesSystemPrompt } from '../services/aiNodeTools';
+import { streamClaudeCode, StreamEvent } from '../services/claudeCode';
+import { createFishWalletMcpServer, ToolCallEvent } from '../services/mcpToolServer';
 import { ideasService } from '../services/ideas';
-import { logger, logStreamEvent, logToolExecution, logApiError } from '../services/logger';
-import Anthropic from '@anthropic-ai/sdk';
+import { branchesService } from '../services/branches';
+import { logger, logApiError } from '../services/logger';
+import { snapshotsService, hasModifyingTools } from '../services/snapshots';
+import { SNAPSHOT_CHANNELS } from './snapshots';
 
 // IPC channel names for dependency node operations
 export const DEPENDENCY_NODES_CHANNELS = {
@@ -31,9 +33,6 @@ export const DEPENDENCY_NODES_CHANNELS = {
   DEPENDENCY_NODES_STREAM_END: 'ai:dependency-nodes-stream-end',
   DEPENDENCY_NODES_STREAM_ERROR: 'ai:dependency-nodes-stream-error'
 } as const;
-
-// Safety limit for tool rounds
-const MAX_TOOL_ROUNDS = 1000;
 
 // Register all dependency nodes IPC handlers
 export function registerDependencyNodesHandlers(): void {
@@ -145,14 +144,15 @@ export function registerDependencyNodesHandlers(): void {
     }
   );
 
-  // Dependency nodes AI stream with node tools
+  // Dependency nodes AI stream — agentic loop via Claude Code subprocess + MCP tools
+  // Each request is a fresh session (no conversation resumption for dependency nodes)
   ipcMain.handle(
     DEPENDENCY_NODES_CHANNELS.DEPENDENCY_NODES_STREAM,
-    async (event, ideaId: string, userMessages: ChatMessage[]): Promise<void> => {
+    async (event, ideaId: string, messageText: string): Promise<void> => {
       const webContents = event.sender;
       const window = BrowserWindow.fromWebContents(webContents);
 
-      logger.info('[DependencyNodes] Stream request received', { ideaId, messageCount: userMessages.length });
+      logger.info('[DependencyNodes] Stream request received', { ideaId, messageLength: messageText.length });
 
       if (!window) {
         logger.error('[DependencyNodes] Could not find browser window');
@@ -169,35 +169,109 @@ export function registerDependencyNodesHandlers(): void {
 
         // Get existing nodes and connections for context
         const state = dependencyNodesService.getFullState(ideaId);
-        const existingNodes = state.nodes.map(n => ({
+        const existingNodes = state.nodes.map((n: { id: string; name: string; provider: string }) => ({
           id: n.id,
           name: n.name,
           provider: n.provider
         }));
-        const existingConnections = state.connections.map(c => ({
+        const existingConnections = state.connections.map((c: { fromNodeId: string; toNodeId: string; label: string | null }) => ({
           fromNodeId: c.fromNodeId,
           toNodeId: c.toNodeId,
           label: c.label
         }));
 
-        // Generate system prompt
-        const systemPrompt = generateDependencyNodesSystemPrompt(idea.title, existingNodes, existingConnections);
-
-        // Build messages array with system prompt
-        const messages: ChatMessage[] = [
-          { role: 'system', content: systemPrompt },
-          ...userMessages
-        ];
-
-        logger.info('[DependencyNodes] Starting agentic stream', { totalMessages: messages.length });
-
-        // Process the stream with agentic tool loop - ALL tools available
-        await processDependencyNodesStream(
-          webContents,
-          ideaId,
-          messages,
-          getAllTools()
+        // Generate system prompt append with dependency nodes context
+        const systemPromptAppend = generateDependencyNodesSystemPrompt(
+          idea.title,
+          existingNodes,
+          existingConnections
         );
+
+        // Create MCP server with all tools for this idea
+        const { server: mcpServer, events: mcpEvents } = createFishWalletMcpServer(ideaId);
+
+        // Track tools called for snapshot creation
+        const allToolsCalled = new Set<string>();
+
+        // Wire up MCP tool call events → renderer side effects
+        mcpEvents.on('toolCall', ({ toolName, result }: ToolCallEvent) => {
+          allToolsCalled.add(toolName);
+
+          // Forward tool result to renderer
+          webContents.send(DEPENDENCY_NODES_CHANNELS.DEPENDENCY_NODES_STREAM_EVENT, {
+            type: 'tool_result',
+            toolName,
+            result
+          });
+
+          // Note proposal → renderer shows approval UI
+          if (toolName === 'propose_note' && result.success && result.data) {
+            const data = result.data as { type?: string; proposal?: unknown };
+            if (data?.type === 'note_proposal' && data?.proposal) {
+              webContents.send(DEPENDENCY_NODES_CHANNELS.DEPENDENCY_NODES_STREAM_EVENT, {
+                type: 'note_proposal',
+                proposal: data.proposal
+              });
+            }
+          }
+
+          // Firecrawl search results → renderer shows search results UI
+          if (toolName === 'firecrawl_search' && result.success) {
+            const searchData = result.data as {
+              results?: Array<{ title: string; url: string; snippet: string; markdown?: string }>;
+            };
+            const searchResults = (searchData.results || []).map((r: { title: string; url: string; snippet: string }, idx: number) => ({
+              rank: idx + 1,
+              title: r.title,
+              url: r.url,
+              snippet: r.snippet || ''
+            }));
+            webContents.send(DEPENDENCY_NODES_CHANNELS.DEPENDENCY_NODES_STREAM_EVENT, {
+              type: 'web_search_result',
+              searchResults
+            });
+          }
+        });
+
+        // Stream the response via Claude Code subprocess (fresh session, no resume)
+        await streamClaudeCode({
+          prompt: messageText,
+          systemPromptAppend,
+          sessionId: null,
+          mcpServer,
+          projectPath: branchesService.getActiveBranchFolderPath(ideaId) || null,
+          onEvent: (streamEvent: StreamEvent) => {
+            // Emit web_search loading indicator before forwarding tool_use event
+            if (streamEvent.type === 'tool_use' && streamEvent.toolName === 'firecrawl_search') {
+              const searchQuery = (streamEvent.input as { query?: string })?.query || '';
+              webContents.send(DEPENDENCY_NODES_CHANNELS.DEPENDENCY_NODES_STREAM_EVENT, {
+                type: 'web_search',
+                toolId: streamEvent.toolId,
+                searchQuery
+              });
+            }
+
+            // Forward all stream events to renderer
+            webContents.send(DEPENDENCY_NODES_CHANNELS.DEPENDENCY_NODES_STREAM_EVENT, streamEvent);
+          },
+          onSessionId: () => {
+            // No session persistence for dependency nodes
+          }
+        });
+
+        // Create version snapshot if any modifying tools were called
+        if (hasModifyingTools(allToolsCalled)) {
+          try {
+            const snapshot = snapshotsService.createSnapshot(ideaId, [...allToolsCalled]);
+            webContents.send(SNAPSHOT_CHANNELS.CREATED, {
+              ideaId,
+              versionNumber: snapshot.versionNumber,
+              snapshotId: snapshot.id
+            });
+          } catch (snapshotError) {
+            logger.error('[DependencyNodes] Failed to create snapshot', { error: snapshotError });
+          }
+        }
 
         logger.info('[DependencyNodes] Stream completed successfully');
         webContents.send(DEPENDENCY_NODES_CHANNELS.DEPENDENCY_NODES_STREAM_END);
@@ -209,365 +283,4 @@ export function registerDependencyNodesHandlers(): void {
       }
     }
   );
-}
-
-// Stream result structure for tracking state
-interface StreamResult {
-  stopReason: string;
-  toolCalls: ToolCall[];
-  assistantContent: Anthropic.ContentBlock[];
-  textContent: string;
-  thinkingContent: string;
-  thinkingSignature?: string;
-}
-
-// Process the agentic stream with tool execution loop
-async function processDependencyNodesStream(
-  webContents: Electron.WebContents,
-  ideaId: string,
-  initialMessages: ChatMessage[],
-  tools: Anthropic.ToolUnion[]
-): Promise<void> {
-  logger.info('[DependencyNodes-Agentic] Starting agentic loop');
-
-  // Track all conversation turns for full context
-  const conversationTurns: ConversationTurn[] = [];
-
-  // First round
-  const firstResult = await streamFirstRound(webContents, initialMessages, tools);
-
-  logger.info('[DependencyNodes-Agentic] First round completed', {
-    stopReason: firstResult.stopReason,
-    toolCallCount: firstResult.toolCalls.length
-  });
-
-  // If no tool calls, we're done
-  if (firstResult.stopReason !== 'tool_use' || firstResult.toolCalls.length === 0) {
-    logger.info('[DependencyNodes-Agentic] No tool calls, ending loop');
-    return;
-  }
-
-  // Execute tool calls
-  const toolResults = await executeToolCallsAndNotify(
-    webContents,
-    ideaId,
-    firstResult.toolCalls
-  );
-
-  // Add first turn to conversation history
-  conversationTurns.push({
-    assistantContent: firstResult.assistantContent,
-    toolResults: toolResults
-  });
-
-  // Continue with tool results
-  await processContinuationRounds(
-    webContents,
-    ideaId,
-    initialMessages,
-    conversationTurns,
-    tools,
-    1
-  );
-}
-
-// Stream the first round
-async function streamFirstRound(
-  webContents: Electron.WebContents,
-  messages: ChatMessage[],
-  tools: Anthropic.ToolUnion[]
-): Promise<StreamResult> {
-  const result: StreamResult = {
-    stopReason: 'end_turn',
-    toolCalls: [],
-    assistantContent: [],
-    textContent: '',
-    thinkingContent: '',
-    thinkingSignature: undefined
-  };
-
-  for await (const streamEvent of langChainService.chatStreamWithTools(messages, tools)) {
-    // Log stream events (skip verbose tool_input_delta)
-    if (streamEvent.type !== 'tool_input_delta') {
-      logStreamEvent('DependencyNodes-FirstRound', streamEvent.type,
-        streamEvent.type === 'tool_start' ? { toolName: streamEvent.toolName } :
-        streamEvent.type === 'done' ? { stopReason: streamEvent.stopReason } :
-        undefined
-      );
-    }
-
-    // Send event to frontend
-    webContents.send(DEPENDENCY_NODES_CHANNELS.DEPENDENCY_NODES_STREAM_EVENT, streamEvent);
-
-    // Collect stream event data
-    collectStreamEventData(streamEvent, result);
-  }
-
-  // Build assistant content blocks
-  buildAssistantContentBlocks(result);
-
-  return result;
-}
-
-// Process continuation rounds after tool execution
-async function processContinuationRounds(
-  webContents: Electron.WebContents,
-  ideaId: string,
-  baseMessages: ChatMessage[],
-  conversationTurns: ConversationTurn[],
-  tools: Anthropic.ToolUnion[],
-  roundNumber: number
-): Promise<void> {
-  logger.info(`[DependencyNodes-Continuation] Starting round ${roundNumber + 1}`);
-
-  if (roundNumber >= MAX_TOOL_ROUNDS) {
-    logger.warn('[DependencyNodes-Continuation] Max tool rounds reached');
-    return;
-  }
-
-  // Stream continuation response with full history
-  const result = await streamContinuationWithFullHistory(
-    webContents,
-    baseMessages,
-    conversationTurns,
-    tools
-  );
-
-  logger.info(`[DependencyNodes-Continuation] Round ${roundNumber + 1} completed`, {
-    stopReason: result.stopReason,
-    toolCallCount: result.toolCalls.length
-  });
-
-  // If no more tool calls, we're done
-  if (result.stopReason !== 'tool_use' || result.toolCalls.length === 0) {
-    logger.info('[DependencyNodes-Continuation] No more tool calls, ending loop');
-    return;
-  }
-
-  // Execute new tool calls
-  const newToolResults = await executeToolCallsAndNotify(
-    webContents,
-    ideaId,
-    result.toolCalls
-  );
-
-  // Add this turn to conversation history
-  conversationTurns.push({
-    assistantContent: result.assistantContent,
-    toolResults: newToolResults
-  });
-
-  // Recursively continue
-  await processContinuationRounds(
-    webContents,
-    ideaId,
-    baseMessages,
-    conversationTurns,
-    tools,
-    roundNumber + 1
-  );
-}
-
-// Stream continuation using full conversation history
-async function streamContinuationWithFullHistory(
-  webContents: Electron.WebContents,
-  baseMessages: ChatMessage[],
-  conversationTurns: ConversationTurn[],
-  tools: Anthropic.ToolUnion[]
-): Promise<StreamResult> {
-  const result: StreamResult = {
-    stopReason: 'end_turn',
-    toolCalls: [],
-    assistantContent: [],
-    textContent: '',
-    thinkingContent: '',
-    thinkingSignature: undefined
-  };
-
-  for await (const streamEvent of langChainService.continueWithFullHistory(
-    baseMessages,
-    conversationTurns,
-    tools
-  )) {
-    if (streamEvent.type !== 'tool_input_delta') {
-      logStreamEvent('DependencyNodes-Continuation', streamEvent.type,
-        streamEvent.type === 'tool_start' ? { toolName: streamEvent.toolName } :
-        streamEvent.type === 'done' ? { stopReason: streamEvent.stopReason } :
-        undefined
-      );
-    }
-
-    webContents.send(DEPENDENCY_NODES_CHANNELS.DEPENDENCY_NODES_STREAM_EVENT, streamEvent);
-    collectStreamEventData(streamEvent, result);
-  }
-
-  buildAssistantContentBlocks(result);
-
-  return result;
-}
-
-// Collect data from stream events
-function collectStreamEventData(streamEvent: StreamEvent, result: StreamResult): void {
-  switch (streamEvent.type) {
-    case 'thinking':
-      result.thinkingContent += streamEvent.content;
-      break;
-
-    case 'thinking_done':
-      if (streamEvent.signature) {
-        result.thinkingSignature = streamEvent.signature;
-      }
-      break;
-
-    case 'text':
-      result.textContent += streamEvent.content;
-      break;
-
-    case 'tool_use':
-      result.toolCalls.push(streamEvent.toolCall);
-      break;
-
-    case 'done':
-      result.stopReason = streamEvent.stopReason;
-      if (streamEvent.thinkingData?.signature) {
-        result.thinkingSignature = streamEvent.thinkingData.signature;
-      }
-      break;
-  }
-}
-
-// Build Anthropic content blocks from collected data
-function buildAssistantContentBlocks(result: StreamResult): void {
-  result.assistantContent = [];
-
-  // Add thinking block if present
-  if (result.thinkingContent && result.thinkingSignature) {
-    result.assistantContent.push({
-      type: 'thinking',
-      thinking: result.thinkingContent,
-      signature: result.thinkingSignature
-    } as unknown as Anthropic.ThinkingBlock);
-  }
-
-  // Add text block
-  if (result.textContent) {
-    result.assistantContent.push({
-      type: 'text',
-      text: result.textContent
-    } as Anthropic.TextBlock);
-  }
-
-  // Add tool use blocks
-  for (const tc of result.toolCalls) {
-    result.assistantContent.push({
-      type: 'tool_use',
-      id: tc.id,
-      name: tc.name,
-      input: tc.input
-    } as Anthropic.ToolUseBlock);
-  }
-}
-
-// Dependency node tool names for routing
-const DEPENDENCY_NODE_TOOL_NAMES = new Set([
-  'create_dependency_node',
-  'update_dependency_node',
-  'delete_dependency_node',
-  'connect_dependency_nodes',
-  'disconnect_dependency_nodes',
-  'read_dependency_nodes'
-]);
-
-// Execute tool calls and send results to frontend
-// Routes to appropriate executor based on tool name
-async function executeToolCallsAndNotify(
-  webContents: Electron.WebContents,
-  ideaId: string,
-  toolCalls: ToolCall[]
-): Promise<Array<{ tool_use_id: string; content: string }>> {
-  const results: Array<{ tool_use_id: string; content: string }> = [];
-
-  for (const tc of toolCalls) {
-    logger.info('[DependencyNodes-ToolExecution] Executing tool', {
-      toolName: tc.name,
-      toolId: tc.id
-    });
-
-    // Emit web_search event for Firecrawl search tools (for UI loading state)
-    if (tc.name === 'firecrawl_search') {
-      const searchQuery = (tc.input as { query?: string })?.query || '';
-      logger.info('[DependencyNodes-ToolExecution] Emitting web_search event for firecrawl_search', { searchQuery });
-      webContents.send(DEPENDENCY_NODES_CHANNELS.DEPENDENCY_NODES_STREAM_EVENT, {
-        type: 'web_search',
-        toolId: tc.id,
-        searchQuery
-      });
-    }
-
-    // Route to appropriate executor based on tool name
-    let result;
-    if (DEPENDENCY_NODE_TOOL_NAMES.has(tc.name)) {
-      // Dependency node tool
-      result = await executeDependencyNodeToolCall(ideaId, tc.name, tc.input);
-    } else {
-      // Synthesis tool, Firecrawl tools, and others
-      result = await executeToolCall(ideaId, tc.name, tc.input);
-    }
-
-    logger.info('[DependencyNodes-ToolExecution] Tool completed', {
-      toolName: tc.name,
-      success: result.success
-    });
-
-    logToolExecution('DependencyNodes', tc.name, tc.input, result);
-
-    results.push({
-      tool_use_id: tc.id,
-      content: JSON.stringify(result)
-    });
-
-    // Emit web_search_result event for Firecrawl search (for UI display)
-    if (tc.name === 'firecrawl_search' && result.success) {
-      const searchData = result.data as {
-        results?: Array<{ title: string; url: string; snippet: string; markdown?: string }>;
-      };
-      const searchResults = (searchData.results || []).map((r, idx) => ({
-        rank: idx + 1,
-        title: r.title,
-        url: r.url,
-        snippet: r.snippet || ''
-      }));
-      logger.info('[DependencyNodes-ToolExecution] Emitting web_search_result event', { resultCount: searchResults.length });
-      webContents.send(DEPENDENCY_NODES_CHANNELS.DEPENDENCY_NODES_STREAM_EVENT, {
-        type: 'web_search_result',
-        toolId: tc.id,
-        searchResults
-      });
-    }
-
-    // Send tool result event to frontend
-    webContents.send(DEPENDENCY_NODES_CHANNELS.DEPENDENCY_NODES_STREAM_EVENT, {
-      type: 'tool_result',
-      toolId: tc.id,
-      toolName: tc.name,
-      result
-    });
-
-    // Handle propose_note specially - emit note_proposal event
-    if (tc.name === 'propose_note' && result.success && result.data) {
-      const proposalData = result.data as { proposalId: string; title: string; content: string; category: string };
-      webContents.send(DEPENDENCY_NODES_CHANNELS.DEPENDENCY_NODES_STREAM_EVENT, {
-        type: 'note_proposal',
-        proposal: {
-          id: proposalData.proposalId,
-          title: proposalData.title,
-          content: proposalData.content,
-          category: proposalData.category,
-          ideaId: ideaId
-        }
-      });
-    }
-  }
-
-  return results;
 }

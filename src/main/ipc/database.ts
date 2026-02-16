@@ -15,7 +15,8 @@ export const DB_CHANNELS = {
   // Message operations
   ADD_MESSAGE: 'db:add-message',
   GET_MESSAGES: 'db:get-messages',
-  DELETE_MESSAGE: 'db:delete-message'
+  DELETE_MESSAGE: 'db:delete-message',
+  UPDATE_MESSAGE_CONTENT_BLOCKS: 'db:update-message-content-blocks'
 } as const;
 
 // Register all database-related IPC handlers
@@ -81,6 +82,8 @@ export function registerDatabaseHandlers(): void {
       content: string;
       inputTokens?: number;
       outputTokens?: number;
+      thinking?: string;
+      contentBlocks?: unknown[];
     }): Message => {
       return databaseService.addMessage(data);
     }
@@ -99,6 +102,14 @@ export function registerDatabaseHandlers(): void {
     DB_CHANNELS.DELETE_MESSAGE,
     (_event, id: string): void => {
       databaseService.deleteMessage(id);
+    }
+  );
+
+  // Update contentBlocks for a message (after tool results arrive)
+  ipcMain.handle(
+    DB_CHANNELS.UPDATE_MESSAGE_CONTENT_BLOCKS,
+    (_event, id: string, contentBlocks: unknown[]): void => {
+      databaseService.updateMessageContentBlocks(id, contentBlocks);
     }
   );
 }

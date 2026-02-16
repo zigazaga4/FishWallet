@@ -2,9 +2,12 @@ import { eq, desc, asc } from 'drizzle-orm';
 import { getDatabase, schema } from '../db';
 import { Idea, NewIdea, Note, NewNote, Conversation, Message } from '../db/schema';
 import { randomUUID } from 'crypto';
+import { rmSync } from 'fs';
+import { join } from 'path';
 import { databaseService } from './database';
-import { fileSystemService } from './fileSystem';
 import { dependencyNodesService } from './dependencyNodes';
+import { scaffoldProject, installDependencies } from './projectScaffold';
+import { logger } from './logger';
 
 // Ideas service for idea and note operations
 export class IdeasService {
@@ -20,8 +23,8 @@ export class IdeasService {
 
   // IDEA OPERATIONS
 
-  // Create a new idea
-  createIdea(data: { title: string }): Idea {
+  // Create a new idea (async to support project scaffolding)
+  async createIdea(data: { title: string }): Promise<Idea> {
     const db = getDatabase();
     const now = this.now();
 
@@ -34,6 +37,20 @@ export class IdeasService {
     };
 
     db.insert(schema.ideas).values(newIdea).run();
+
+    // Scaffold a Vite project for this idea
+    const scaffoldResult = await scaffoldProject(data.title);
+    if (scaffoldResult.success && scaffoldResult.projectPath) {
+      db.update(schema.ideas)
+        .set({ projectPath: scaffoldResult.projectPath })
+        .where(eq(schema.ideas.id, newIdea.id))
+        .run();
+
+      // Fire npm install in background — runs in the main/ branch subfolder
+      installDependencies(join(scaffoldResult.projectPath, 'main')).catch((err) => {
+        logger.error('[Ideas] Background npm install failed', { error: err });
+      });
+    }
 
     return this.getIdea(newIdea.id)!;
   }
@@ -80,9 +97,21 @@ export class IdeasService {
     return updated;
   }
 
-  // Delete an idea (cascades to notes)
+  // Delete an idea (cascades to notes, removes project folder)
   deleteIdea(id: string): void {
     const db = getDatabase();
+    const idea = this.getIdea(id);
+
+    // Remove project folder from disk if it exists
+    if (idea?.projectPath) {
+      try {
+        rmSync(idea.projectPath, { recursive: true, force: true });
+        logger.info('[Ideas] Removed project folder', { projectPath: idea.projectPath });
+      } catch (err) {
+        logger.error('[Ideas] Failed to remove project folder', { error: err });
+      }
+    }
+
     db.delete(schema.ideas).where(eq(schema.ideas.id, id)).run();
   }
 
@@ -262,9 +291,6 @@ Start by providing a comprehensive synthesis of their idea, then be ready to dis
       })
       .where(eq(schema.ideas.id, ideaId))
       .run();
-
-    // Also delete all project files for this idea (app builder files)
-    fileSystemService.deleteAllFilesForIdea(ideaId);
 
     // Also delete all API nodes for this idea
     dependencyNodesService.deleteAllNodesForIdea(ideaId);

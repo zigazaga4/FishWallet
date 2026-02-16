@@ -9,23 +9,11 @@ import { LivePreview } from './LivePreview';
 import { DependencyNodesView } from './DependencyNodesView';
 import { IdeaStatistics } from './IdeaStatistics';
 
-// Preview mode type - desktop (default), phone (constrained dimensions), or fullscreen (expanded)
-export type PreviewMode = 'desktop' | 'phone' | 'fullscreen';
+// Preview mode type - desktop (default), phone (constrained dimensions), fullscreen (expanded), fullscreen-phone
+export type PreviewMode = 'desktop' | 'phone' | 'fullscreen' | 'fullscreen-phone';
 
 // Panel tab types
 export type PanelTab = 'main-idea' | 'dependency-nodes' | 'app' | 'statistics';
-
-// Project file interface
-interface ProjectFile {
-  id: string;
-  ideaId: string;
-  filePath: string;
-  content: string;
-  fileType: 'tsx' | 'ts' | 'css';
-  isEntryFile: boolean;
-  createdAt: Date;
-  updatedAt: Date;
-}
 
 // Dependency Node type
 interface DependencyNode {
@@ -69,10 +57,6 @@ interface PanelProps {
   // Tab control (lifted to parent)
   activeTab: PanelTab;
   onTabChange: (tab: PanelTab) => void;
-  // App builder props
-  appFiles: ProjectFile[];
-  appEntryFile: ProjectFile | null;
-  appLoading: boolean;
   // Dependency nodes props
   dependencyNodes: DependencyNode[];
   dependencyConnections: DependencyNodeConnection[];
@@ -80,10 +64,23 @@ interface PanelProps {
   onNodePositionChange?: (nodeId: string, x: number, y: number) => void;
   // Idea ID for error reporting
   ideaId: string;
+  // Active branch ID — triggers dev server restart on branch switch
+  activeBranchId?: string | null;
   // Conversation ID for statistics
   conversationId: string | null;
   // Live streaming tokens for statistics
   streamingTokens?: StreamingTokens;
+  // Snapshot viewing mode
+  viewingSnapshot?: {
+    versionNumber: number;
+    synthesisContent: string | null;
+    nodes: DependencyNode[];
+    connections: DependencyNodeConnection[];
+  };
+  onBackToLive?: () => void;
+  onRestoreSnapshot?: () => void;
+  // Incremented after AI completes to trigger iframe reload
+  previewRefreshKey?: number;
 }
 
 // Floating side panel component
@@ -94,16 +91,18 @@ export function Panel({
   onClose,
   activeTab,
   onTabChange,
-  appFiles,
-  appEntryFile,
-  appLoading,
   dependencyNodes,
   dependencyConnections,
   dependencyNodesLoading,
   onNodePositionChange,
   ideaId,
+  activeBranchId,
   conversationId,
-  streamingTokens
+  streamingTokens,
+  viewingSnapshot,
+  onBackToLive,
+  onRestoreSnapshot,
+  previewRefreshKey
 }: PanelProps): ReactElement | null {
   // Preview mode state - desktop, phone, or fullscreen
   const [previewMode, setPreviewMode] = useState<PreviewMode>('desktop');
@@ -111,6 +110,11 @@ export function Panel({
   if (!isOpen) {
     return null;
   }
+
+  // When viewing a snapshot, override data sources
+  const effectiveContent = viewingSnapshot ? (viewingSnapshot.synthesisContent || '') : content;
+  const effectiveNodes = viewingSnapshot ? viewingSnapshot.nodes : dependencyNodes;
+  const effectiveConnections = viewingSnapshot ? viewingSnapshot.connections : dependencyConnections;
 
   /* eslint-disable @typescript-eslint/no-explicit-any */
   const markdownComponents: Record<string, React.ComponentType<any>> = {
@@ -181,7 +185,7 @@ export function Panel({
     switch (activeTab) {
       case 'main-idea':
         // Main Idea tab - markdown synthesis content
-        if (isLoading && !content) {
+        if (isLoading && !effectiveContent) {
           return (
             <div className="flex flex-col items-center justify-center h-full text-blue-300/60">
               <svg className="w-8 h-8 animate-spin text-sky-400 mb-3" fill="none" viewBox="0 0 24 24">
@@ -193,14 +197,14 @@ export function Panel({
           );
         }
 
-        if (content) {
+        if (effectiveContent) {
           return (
             <div className="prose prose-invert max-w-none">
               <ReactMarkdown
                 remarkPlugins={[remarkGfm]}
                 components={markdownComponents}
               >
-                {content}
+                {effectiveContent}
               </ReactMarkdown>
             </div>
           );
@@ -220,10 +224,10 @@ export function Panel({
         // Dependency Nodes tab - Visual node canvas
         return (
           <DependencyNodesView
-            nodes={dependencyNodes}
-            connections={dependencyConnections}
-            isLoading={dependencyNodesLoading}
-            onNodePositionChange={onNodePositionChange}
+            nodes={effectiveNodes}
+            connections={effectiveConnections}
+            isLoading={!viewingSnapshot && dependencyNodesLoading}
+            onNodePositionChange={viewingSnapshot ? undefined : onNodePositionChange}
           />
         );
 
@@ -267,24 +271,42 @@ export function Panel({
               </button>
             </div>
             {/* Preview container with mode-based sizing */}
-            <div className={`flex-1 ${previewMode === 'fullscreen' ? 'fixed inset-0 z-50 bg-[#0d1f3c] p-4' : ''}`}>
-              {previewMode === 'fullscreen' && (
-                <button
-                  onClick={() => setPreviewMode('desktop')}
-                  className="absolute top-4 right-4 p-2 bg-[#1e3a5f] text-blue-300 hover:text-blue-100 rounded-lg z-10"
-                  title="Exit fullscreen"
-                >
-                  <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                  </svg>
-                </button>
+            <div className={`flex-1 ${previewMode === 'fullscreen' || previewMode === 'fullscreen-phone' ? 'fixed inset-0 z-50 bg-[#0d1f3c] p-4' : ''}`}>
+              {(previewMode === 'fullscreen' || previewMode === 'fullscreen-phone') && (
+                <div className="absolute top-4 right-4 flex items-center gap-2 z-10">
+                  {/* Phone toggle in fullscreen */}
+                  <button
+                    onClick={() => setPreviewMode(previewMode === 'fullscreen-phone' ? 'fullscreen' : 'fullscreen-phone')}
+                    className={`p-2 rounded-lg transition-colors ${
+                      previewMode === 'fullscreen-phone'
+                        ? 'bg-sky-500/20 text-sky-400'
+                        : 'bg-[#1e3a5f] text-blue-300 hover:text-blue-100'
+                    }`}
+                    title={previewMode === 'fullscreen-phone' ? 'Desktop view' : 'Phone view'}
+                  >
+                    <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                            d="M12 18h.01M8 21h8a2 2 0 002-2V5a2 2 0 00-2-2H8a2 2 0 00-2 2v14a2 2 0 002 2z" />
+                    </svg>
+                  </button>
+                  {/* Close fullscreen */}
+                  <button
+                    onClick={() => setPreviewMode('desktop')}
+                    className="p-2 bg-[#1e3a5f] text-blue-300 hover:text-blue-100 rounded-lg"
+                    title="Exit fullscreen"
+                  >
+                    <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                  </button>
+                </div>
               )}
               <LivePreview
-                entryFile={appEntryFile}
-                allFiles={appFiles}
-                isLoading={appLoading}
-                previewMode={previewMode}
                 ideaId={ideaId}
+                activeBranchId={activeBranchId}
+                previewMode={previewMode === 'fullscreen-phone' ? 'phone' : previewMode}
+                isSnapshot={!!viewingSnapshot}
+                refreshKey={previewRefreshKey}
               />
             </div>
           </div>
@@ -317,7 +339,7 @@ export function Panel({
                       d="M4 5a1 1 0 011-1h14a1 1 0 011 1v2a1 1 0 01-1 1H5a1 1 0 01-1-1V5zM4 13a1 1 0 011-1h6a1 1 0 011 1v6a1 1 0 01-1 1H5a1 1 0 01-1-1v-6zM16 13a1 1 0 011-1h2a1 1 0 011 1v6a1 1 0 01-1 1h-2a1 1 0 01-1-1v-6z" />
               </svg>
               <span className="text-blue-50 font-medium">Panel</span>
-              {(isLoading || appLoading) && (
+              {isLoading && (
                 <svg className="w-4 h-4 animate-spin text-sky-400 ml-2" fill="none" viewBox="0 0 24 24">
                   <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
                   <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
@@ -379,6 +401,29 @@ export function Panel({
             </button>
           </div>
         </div>
+
+        {/* Snapshot viewing banner */}
+        {viewingSnapshot && (
+          <div className="flex items-center justify-between px-4 py-2 bg-indigo-900/40 border-b border-indigo-500/30">
+            <span className="text-indigo-300 text-sm font-medium">
+              Viewing Version {viewingSnapshot.versionNumber}
+            </span>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={onBackToLive}
+                className="px-3 py-1 text-xs rounded-lg bg-[#1e3a5f] text-blue-300 hover:text-blue-100 hover:bg-[#2a4a6f] transition-colors"
+              >
+                Back to Live
+              </button>
+              <button
+                onClick={onRestoreSnapshot}
+                className="px-3 py-1 text-xs rounded-lg bg-amber-900/40 text-amber-300 hover:text-amber-100 hover:bg-amber-900/60 transition-colors border border-amber-500/30"
+              >
+                Restore This Version
+              </button>
+            </div>
+          </div>
+        )}
 
         {/* Content */}
         <div className="flex-1 overflow-y-auto p-4">

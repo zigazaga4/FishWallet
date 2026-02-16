@@ -4,7 +4,7 @@
 // Supports zoom, pan, and drag
 // Guided by the Holy Spirit
 
-import { useState, useRef, useCallback, useEffect, type ReactElement, type MouseEvent, type WheelEvent } from 'react';
+import { useState, useRef, useCallback, useEffect, useMemo, type ReactElement, type MouseEvent, type WheelEvent } from 'react';
 
 // Pricing/licensing information structure
 interface PricingInfo {
@@ -659,73 +659,103 @@ export function DependencyNodesView({
 
   const containerRef = useRef<HTMLDivElement>(null);
   const lastConnectionCount = useRef<number>(-1); // -1 means "not initialized"
+  const lastNodeCount = useRef<number>(-1);
   const manuallyPositioned = useRef<Set<string>>(new Set());
   const layoutInProgress = useRef<boolean>(false);
   const layoutAttemptedForNodes = useRef<Set<string>>(new Set());
+  const layoutDebounceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingLayoutData = useRef<{ nodes: DependencyNode[]; connections: DependencyNodeConnection[] } | null>(null);
 
-  // Auto-layout effect - triggers for new nodes at (0,0) or when connections change
+  // Detect if we're in a bulk update (many changes happening rapidly)
+  const isBulkUpdate = useMemo(() => {
+    // If more than 20 connections, likely a bulk operation - disable animations
+    return connections.length > 20;
+  }, [connections.length]);
+
+  // Auto-layout effect - DEBOUNCED to prevent renderer crash during bulk operations
   useEffect(() => {
     // Don't run layout while loading
     if (isLoading) return;
     if (nodes.length === 0 || !onNodePositionChange) return;
 
-    // Prevent concurrent layout operations
-    if (layoutInProgress.current) return;
+    // Store the latest data for the debounced function
+    pendingLayoutData.current = { nodes, connections };
 
-    // Check for new nodes at (0,0) that need initial layout
+    // Clear any pending debounce timer
+    if (layoutDebounceTimer.current) {
+      clearTimeout(layoutDebounceTimer.current);
+    }
+
+    // Check if this is a significant change that needs layout
+    const nodeCountChanged = lastNodeCount.current !== -1 && nodes.length !== lastNodeCount.current;
+    const connectionCountChanged = lastConnectionCount.current !== -1 && connections.length !== lastConnectionCount.current;
     const newNodesAtOrigin = nodes.filter(
       n => n.positionX === 0 && n.positionY === 0 && !layoutAttemptedForNodes.current.has(n.id)
     );
 
-    // Check if connections changed (track by count for simplicity)
-    const isFirstMount = lastConnectionCount.current === -1;
-    const connectionCountChanged = !isFirstMount && connections.length !== lastConnectionCount.current;
-
-    // Update connection count tracking
+    // Update counts
+    lastNodeCount.current = nodes.length;
     lastConnectionCount.current = connections.length;
 
-    // Layout if:
-    // 1. There are new nodes at (0,0) that need positioning
-    // 2. OR connections changed (to re-arrange based on new graph structure)
-    const shouldLayout = newNodesAtOrigin.length > 0 || connectionCountChanged;
-
+    const shouldLayout = newNodesAtOrigin.length > 0 || nodeCountChanged || connectionCountChanged;
     if (!shouldLayout) return;
 
-    // Mark all current nodes as "attempted"
-    nodes.forEach(n => layoutAttemptedForNodes.current.add(n.id));
-    layoutInProgress.current = true;
+    // Prevent concurrent layout operations
+    if (layoutInProgress.current) return;
 
-    // Calculate positions
-    const positions = calculateAutoLayout(nodes, connections);
+    // DEBOUNCE: Wait for changes to settle before recalculating layout
+    // Use longer debounce (500ms) for bulk operations, shorter (100ms) for single changes
+    const debounceTime = (nodes.length > 10 || connections.length > 10) ? 500 : 100;
 
-    // Collect position changes
-    const positionChanges: Array<{ nodeId: string; x: number; y: number }> = [];
+    layoutDebounceTimer.current = setTimeout(() => {
+      const data = pendingLayoutData.current;
+      if (!data || layoutInProgress.current) return;
 
-    nodes.forEach(node => {
-      // Skip manually positioned nodes (unless at 0,0 or this is a connection change relayout)
-      if (manuallyPositioned.current.has(node.id) && node.positionX !== 0 && node.positionY !== 0 && !connectionCountChanged) {
-        return;
-      }
+      layoutInProgress.current = true;
 
-      const pos = positions.get(node.id);
-      if (pos && (node.positionX !== pos.x || node.positionY !== pos.y)) {
-        positionChanges.push({ nodeId: node.id, x: pos.x, y: pos.y });
-      }
-    });
+      // Mark all current nodes as "attempted"
+      data.nodes.forEach(n => layoutAttemptedForNodes.current.add(n.id));
 
-    // Apply changes
-    if (positionChanges.length > 0) {
-      setTimeout(() => {
-        positionChanges.forEach(change => {
-          onNodePositionChange(change.nodeId, change.x, change.y);
+      // Calculate positions
+      const positions = calculateAutoLayout(data.nodes, data.connections);
+
+      // Collect position changes
+      const positionChanges: Array<{ nodeId: string; x: number; y: number }> = [];
+
+      data.nodes.forEach(node => {
+        // Skip manually positioned nodes (unless at 0,0)
+        if (manuallyPositioned.current.has(node.id) && node.positionX !== 0 && node.positionY !== 0) {
+          return;
+        }
+
+        const pos = positions.get(node.id);
+        if (pos && (node.positionX !== pos.x || node.positionY !== pos.y)) {
+          positionChanges.push({ nodeId: node.id, x: pos.x, y: pos.y });
+        }
+      });
+
+      // Apply changes in a single batch using requestAnimationFrame
+      if (positionChanges.length > 0) {
+        requestAnimationFrame(() => {
+          positionChanges.forEach(change => {
+            onNodePositionChange(change.nodeId, change.x, change.y);
+          });
+          // Allow next layout after a short delay
+          setTimeout(() => {
+            layoutInProgress.current = false;
+          }, 100);
         });
-        setTimeout(() => {
-          layoutInProgress.current = false;
-        }, 300);
-      }, 0);
-    } else {
-      layoutInProgress.current = false;
-    }
+      } else {
+        layoutInProgress.current = false;
+      }
+    }, debounceTime);
+
+    // Cleanup on unmount
+    return () => {
+      if (layoutDebounceTimer.current) {
+        clearTimeout(layoutDebounceTimer.current);
+      }
+    };
   }, [nodes, connections, onNodePositionChange, isLoading]);
 
   // Track when user manually drags a node
@@ -991,10 +1021,12 @@ export function DependencyNodesView({
               const toNode = nodes.find(n => n.id === conn.toNodeId);
               if (!fromNode || !toNode) return null;
               const path = calculateConnectionPath(fromNode, toNode);
-              // Stagger animation start times
+              // Stagger animation start times - only used when animations are enabled
               const delay1 = (index * 0.3) % 2;
               const delay2 = ((index * 0.3) + 1) % 2;
               const isHovered = hoveredConnectionId === conn.id;
+              // Disable animations for performance when there are many connections
+              const showAnimations = !isBulkUpdate && connections.length <= 20;
               return (
                 <g key={conn.id} className="connection-group">
                   {/* Invisible wider path for hover detection and click */}
@@ -1015,7 +1047,7 @@ export function DependencyNodesView({
                     fill="none"
                     stroke={isHovered ? '#1e4a7f' : '#1e3a5f'}
                     strokeWidth={isHovered ? 4 : 3}
-                    className="pointer-events-none transition-all duration-150"
+                    className="pointer-events-none"
                   />
                   {/* Visible connection line */}
                   <path
@@ -1024,21 +1056,25 @@ export function DependencyNodesView({
                     stroke={isHovered ? '#60a5fa' : '#3b82f6'}
                     strokeWidth={isHovered ? 3 : 2}
                     strokeOpacity={isHovered ? 0.9 : 0.6}
-                    className="pointer-events-none transition-all duration-150"
+                    className="pointer-events-none"
                   />
-                  {/* Animated flow dots */}
-                  <circle r="4" fill="#60a5fa" filter="url(#glow)" className="pointer-events-none">
-                    <animateMotion dur="2s" repeatCount="indefinite" begin={`${delay1}s`}>
-                      <mpath href={`#flow-path-${conn.id}`} />
-                    </animateMotion>
-                  </circle>
-                  <circle r="3" fill="#93c5fd" filter="url(#glow)" className="pointer-events-none">
-                    <animateMotion dur="2s" repeatCount="indefinite" begin={`${delay2}s`}>
-                      <mpath href={`#flow-path-${conn.id}`} />
-                    </animateMotion>
-                  </circle>
-                  {/* Hidden path for animation reference */}
-                  <path id={`flow-path-${conn.id}`} d={path} fill="none" stroke="none" className="pointer-events-none" />
+                  {/* Animated flow dots - ONLY when not in bulk mode */}
+                  {showAnimations && (
+                    <>
+                      <circle r="4" fill="#60a5fa" filter="url(#glow)" className="pointer-events-none">
+                        <animateMotion dur="2s" repeatCount="indefinite" begin={`${delay1}s`}>
+                          <mpath href={`#flow-path-${conn.id}`} />
+                        </animateMotion>
+                      </circle>
+                      <circle r="3" fill="#93c5fd" filter="url(#glow)" className="pointer-events-none">
+                        <animateMotion dur="2s" repeatCount="indefinite" begin={`${delay2}s`}>
+                          <mpath href={`#flow-path-${conn.id}`} />
+                        </animateMotion>
+                      </circle>
+                      {/* Hidden path for animation reference */}
+                      <path id={`flow-path-${conn.id}`} d={path} fill="none" stroke="none" className="pointer-events-none" />
+                    </>
+                  )}
                   {/* Arrow at end */}
                   <path
                     d={path}
@@ -1046,17 +1082,17 @@ export function DependencyNodesView({
                     stroke={isHovered ? '#60a5fa' : '#3b82f6'}
                     strokeWidth={isHovered ? 3 : 2}
                     markerEnd={isHovered ? 'url(#arrowhead-hover)' : 'url(#arrowhead)'}
-                    className="pointer-events-none transition-all duration-150"
+                    className="pointer-events-none"
                   />
-                  {/* Connection label - always visible if exists */}
-                  {conn.label && (
+                  {/* Connection label - only show for first 50 connections to avoid clutter */}
+                  {conn.label && index < 50 && (
                     <text
                       x={(fromNode.positionX + NODE_WIDTH + toNode.positionX) / 2}
                       y={(fromNode.positionY + toNode.positionY + NODE_HEIGHT) / 2 - 12}
                       fill={isHovered ? '#bfdbfe' : '#93c5fd'}
                       fontSize={isHovered ? '11' : '10'}
                       textAnchor="middle"
-                      className="font-medium pointer-events-none transition-all duration-150"
+                      className="font-medium pointer-events-none"
                     >
                       {conn.label}
                     </text>

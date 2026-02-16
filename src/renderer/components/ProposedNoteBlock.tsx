@@ -2,7 +2,7 @@
 // Shows collapsible content and allows user to approve adding notes to the idea
 // Guided by the Holy Spirit
 
-import { useState, type ReactElement } from 'react';
+import { useState, memo, type ReactElement } from 'react';
 
 // Proposed note interface
 interface ProposedNote {
@@ -88,7 +88,7 @@ const categoryStyles: Record<ProposedNote['category'], { bg: string; text: strin
 };
 
 // Proposed note block component with accept/reject functionality
-export function ProposedNoteBlock({
+export const ProposedNoteBlock = memo(function ProposedNoteBlock({
   proposal,
   onAccept,
   onReject,
@@ -208,4 +208,4 @@ export function ProposedNoteBlock({
       )}
     </div>
   );
-}
+});
